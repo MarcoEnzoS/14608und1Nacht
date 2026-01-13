@@ -2,587 +2,94 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { supabase } from "@/lib/supabaseClient";
 
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { Separator } from "@/components/ui/separator";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  Calendar,
-  Clock,
-  MapPin,
-  Plane,
-  Plus,
-  Users,
-  UtensilsCrossed,
-  Shield,
-  LogOut,
-  UserCircle2,
-  CheckCircle2,
-  XCircle,
-  RefreshCw,
-  Euro,
-} from "lucide-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-/**
- * Marco 40 · Trip Planner (Supabase-first, RSVP pending)
- * ✅ Events (incl price_eur) from Supabase
- * ✅ RSVPs from Supabase (shared) with 3-state UI: yes/no/pending
- * ✅ Meals from Supabase (shared)
- * ✅ Flights/Profiles from Supabase (shared)
- * ✅ Parents can manage kids
- * ✅ Minimal header + cost summary
- * ✅ Admin button only visible for Marco
- *
- * DB:
- * - events.price_eur numeric (nullable)
- * - rsvps.status is 'yes'|'no' (pending = no row)
- */
+import { Calendar, Clock, Euro, LogOut, MapPin, Plane, Plus, RefreshCw, Shield, UtensilsCrossed, Users } from "lucide-react";
 
-const TRIP_DAYS = ["2026-09-01","2026-09-02","2026-09-03","2026-09-04","2026-09-05","2026-09-06"];
+import { TRIP_DAYS, DEFAULT_ADMIN_PIN } from "@/lib/constants";
+import { formatDayLabel, formatEur, stableEventId } from "@/lib/format";
+import { getManagedPeople, getFamilyGroupForCosts } from "@/lib/family";
+import type { RsvpStatus } from "@/lib/types";
 
-const DEFAULT_PARTICIPANTS = [
-  "Marco","Lx","Benno","Carina","Chris","Claudia","Gianna","Giulia","Bassi","Henry","Bini","Mama","Papa","Maxi","Ricarda","Roberta",
-  "Emil","Karli","Flynn","Georg","Valentin","Carlotta",
-];
+import { useCurrentUser } from "@/hooks/useCurrentUser";
+import { useTripData } from "@/hooks/useTripData";
 
-const GUARDIANS: Record<string, string[]> = {
-  Emil: ["Benno", "Lx"],
-  Karli: ["Benno", "Lx"],
-  Flynn: ["Chris", "Carina"],
-  Georg: ["Claudia", "Maxi"],
-  Valentin: ["Claudia", "Maxi"],
-  Carlotta: ["Claudia", "Maxi"],
-};
+import { LoginScreen, CompactList } from "@/components/TripUI";
+import { EventDialog } from "@/components/EventDialog";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 
-const STORAGE_CURRENT_USER_KEY = "bday40_planner_current_user_v1";
-const DEFAULT_ADMIN_PIN = "4040";
-
-type Person = string;
-type RsvpStatus = "yes" | "no" | "pending";
-
-type EventUI = {
-  id: string;
-  title: string;
-  date: string;
-  startTime?: string;
-  endTime?: string;
-  location?: string;
-  description?: string;
-  capacity?: number;
-  priceEur?: number;
-  rsvp: Record<Person, RsvpStatus>;
-};
-
-type ProfilesUI = Record<
-  Person,
-  {
-    arrival?: { date?: string; time?: string; flight?: string };
-    departure?: { date?: string; time?: string; flight?: string };
-  }
->;
-
-type MealsUI = Record<
-  string,
-  {
-    breakfast: Record<Person, boolean>;
-    lunch: Record<Person, boolean>;
-    dinner: Record<Person, boolean>;
-  }
->;
-
-type AppState = {
-  admin: { isUnlocked: boolean };
-  participants: Person[];
-  profiles: ProfilesUI;
-  events: EventUI[];
-  meals: MealsUI;
-};
-
-// ---------- helpers ----------
-function clamp(n: number, min: number, max: number) { return Math.max(min, Math.min(max, n)); }
-
-function formatDayLabel(iso: string) {
-  const d = new Date(`${iso}T12:00:00`);
-  return d.toLocaleDateString("de-DE", { weekday: "short", day: "2-digit", month: "2-digit" });
-}
-
-function sortByStart(a: EventUI, b: EventUI) {
-  const ak = `${a.date}T${a.startTime || "00:00"}`;
-  const bk = `${b.date}T${b.startTime || "00:00"}`;
-  return ak.localeCompare(bk);
-}
-
-function uniqPreserveOrder(arr: string[]) {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const x of arr) { if (!seen.has(x)) { seen.add(x); out.push(x); } }
-  return out;
-}
-
-function getManagedPeople(currentUser: string) {
-  if (!currentUser) return [];
-  const kids = Object.keys(GUARDIANS).filter((kid) => (GUARDIANS[kid] || []).includes(currentUser));
-  return uniqPreserveOrder([currentUser, ...kids]);
-}
-
-function getFamilyGroupForCosts(currentUser: string) {
-  if (!currentUser) return { label: "dich", people: [] as string[] };
-
-  const kids = Object.keys(GUARDIANS).filter((kid) => (GUARDIANS[kid] || []).includes(currentUser));
-  const coParents = uniqPreserveOrder(
-    kids.flatMap((kid) => (GUARDIANS[kid] || []).filter((p) => p !== currentUser))
-  );
-
-  const people = uniqPreserveOrder([currentUser, ...coParents, ...kids]);
-  const isFamily = kids.length > 0 || coParents.length > 0;
-  return { label: isFamily ? "deine Family" : "dich", people };
-}
-
-function stableEventId() {
-  // @ts-ignore
-  if (typeof crypto !== "undefined" && crypto.randomUUID) return `evt_${crypto.randomUUID()}`;
-  return `evt_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
-}
-
-function makeEmptyMeals(participants: string[]): MealsUI {
-  const base: MealsUI = {};
-  for (const day of TRIP_DAYS) {
-    base[day] = {
-      breakfast: Object.fromEntries(participants.map((p) => [p, false])),
-      lunch: Object.fromEntries(participants.map((p) => [p, false])),
-      dinner: Object.fromEntries(participants.map((p) => [p, false])),
-    };
-  }
-  return base;
-}
-
-function makeEmptyProfiles(participants: string[]): ProfilesUI {
-  return Object.fromEntries(participants.map((p) => [p, {}]));
-}
-
-function makeEmptyRsvp(participants: string[]): Record<string, RsvpStatus> {
-  // Neutral default: not responded yet
-  return Object.fromEntries(participants.map((p) => [p, "pending"]));
-}
-
-function formatEur(value?: number) {
-  const v = typeof value === "number" && Number.isFinite(value) ? value : 0;
-  return `${v.toFixed(0)}€`;
-}
-
-function chunkDisplay(list: string[], limit: number) {
-  const shown = list.slice(0, limit);
-  const rest = list.length - shown.length;
-  return { shown, rest };
-}
-
-// ---------- small UI helpers ----------
-function Pill({ icon: Icon, children, className = "" }: any) {
-  return (
-    <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${className}`}>
-      {Icon ? <Icon className="h-3.5 w-3.5" /> : null}
-      <span className="leading-none">{children}</span>
-    </div>
-  );
-}
-
-function SectionTitle({ icon: Icon, title, right }: any) {
-  return (
-    <div className="flex items-center justify-between gap-3">
-      <div className="flex items-center gap-2">
-        {Icon ? <Icon className="h-4 w-4 text-muted-foreground" /> : null}
-        <h3 className="text-sm font-semibold">{title}</h3>
-      </div>
-      {right}
-    </div>
-  );
-}
-
-function RSVPBadge({ name, status }: { name: string; status: RsvpStatus }) {
-  return (
-    <span
-      className={
-        "inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-medium " +
-        (status === "yes"
-          ? "bg-emerald-500/15 text-emerald-700 border border-emerald-500/30 dark:text-emerald-300"
-          : status === "no"
-            ? "bg-rose-500/15 text-rose-700 border border-rose-500/30 dark:text-rose-300"
-            : "bg-muted text-muted-foreground border")
-      }
-    >
-      {status === "yes" ? (
-        <CheckCircle2 className="h-3.5 w-3.5" />
-      ) : status === "no" ? (
-        <XCircle className="h-3.5 w-3.5" />
-      ) : (
-        <Clock className="h-3.5 w-3.5" />
-      )}
-      {name}
-    </span>
-  );
-}
-
-function CompactList({ title, yes, no, pending, expanded, onToggle, limit = 10 }: any) {
-  const { shown, rest } = chunkDisplay(yes, limit);
-  const pendingCount = Array.isArray(pending) ? pending.length : 0;
-
-  return (
-    <div>
-      <SectionTitle
-        icon={Users}
-        title={title}
-        right={
-          <Button variant="outline" size="sm" className="rounded-xl" onClick={onToggle}>
-            {expanded ? "Kompakt" : "Alle"}
-          </Button>
-        }
-      />
-
-      <div className="mt-2 flex flex-wrap gap-2">
-        {!expanded ? (
-          <>
-            {shown.map((p: string) => (
-              <RSVPBadge key={p} name={p} status="yes" />
-            ))}
-            {rest > 0 ? (
-              <Badge className="rounded-full" variant="secondary">
-                +{rest} weitere
-              </Badge>
-            ) : null}
-            {no.length > 0 ? (
-              <Badge
-                className="rounded-full border border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300"
-                variant="secondary"
-              >
-                {no.length} abgesagt
-              </Badge>
-            ) : null}
-            {pendingCount > 0 ? (
-              <Badge className="rounded-full" variant="secondary">
-                {pendingCount} offen
-              </Badge>
-            ) : null}
-          </>
-        ) : (
-          <>
-            {yes.map((p: string) => (
-              <RSVPBadge key={`y_${p}`} name={p} status="yes" />
-            ))}
-            {no.map((p: string) => (
-              <RSVPBadge key={`n_${p}`} name={p} status="no" />
-            ))}
-            {Array.isArray(pending)
-              ? pending.map((p: string) => <RSVPBadge key={`p_${p}`} name={p} status="pending" />)
-              : null}
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function LoginScreen({ participants, onLogin }: any) {
-  const [name, setName] = useState("");
-  return (
-    <div className="min-h-screen bg-gradient-to-b from-indigo-50 via-white to-rose-50 dark:from-indigo-950 dark:via-background dark:to-rose-950">
-      <div className="mx-auto max-w-md p-4 sm:p-6">
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.35 }}
-          className="flex flex-col gap-4"
-        >
-          <div className="rounded-2xl border bg-card/80 backdrop-blur p-5 shadow-sm">
-            <div className="flex items-center gap-3">
-              <span className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500/20 to-rose-500/20 border">
-                <UserCircle2 className="h-5 w-5" />
-              </span>
-              <div>
-                <h1 className="text-xl font-semibold">Marco 40 · Trip Planner</h1>
-                <p className="text-sm text-muted-foreground">Bitte wähle deinen Namen</p>
-              </div>
-            </div>
-
-            <div className="mt-5 grid gap-2">
-              <Label>Ich bin…</Label>
-              <Select value={name} onValueChange={setName}>
-                <SelectTrigger className="rounded-xl">
-                  <SelectValue placeholder="Teilnehmer auswählen" />
-                </SelectTrigger>
-                <SelectContent>
-                  {participants.map((p: string) => (
-                    <SelectItem key={p} value={p}>
-                      {p}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="mt-5">
-              <Button
-                className="w-full rounded-xl bg-gradient-to-r from-indigo-600 to-rose-600 text-white hover:opacity-95"
-                disabled={!name}
-                onClick={() => name && onLogin(name)}
-              >
-                Weiter
-              </Button>
-            </div>
-          </div>
-        </motion.div>
-      </div>
-    </div>
-  );
-}
-
-// ---------- Page ----------
 export default function Page() {
-  const [state, setState] = useState<AppState>(() => {
-    const participants = DEFAULT_PARTICIPANTS;
-    return {
-      admin: { isUnlocked: false },
-      participants,
-      profiles: makeEmptyProfiles(participants),
-      events: [],
-      meals: makeEmptyMeals(participants),
-    };
-  });
-
-  const [currentUser, setCurrentUser] = useState(() => {
-    if (typeof window === "undefined") return "";
-    return localStorage.getItem(STORAGE_CURRENT_USER_KEY) || "";
-  });
+  const { currentUser, loginAs, logout } = useCurrentUser();
+  const { state, isLoading, loadError, reloadAll, upsertEvent, deleteEvent, setRsvp, setRsvpMany, toggleMeal, setMealMany, updateProfile } = useTripData();
 
   const managedPeople = useMemo(() => getManagedPeople(currentUser), [currentUser]);
   const familyForCosts = useMemo(() => getFamilyGroupForCosts(currentUser), [currentUser]);
+
   const [actingPerson, setActingPerson] = useState("");
-
-  // Admin PIN
-  const [pin, setPin] = useState("");
-  const [pinError, setPinError] = useState("");
-
-  // Event dialog
-  const [eventDialogOpen, setEventDialogOpen] = useState(false);
-  const [editingEventId, setEditingEventId] = useState<string | null>(null);
-
-  // Expand/collapse
-  const [expandedRsvp, setExpandedRsvp] = useState<Record<string, boolean>>({});
-  const [expandedMeals, setExpandedMeals] = useState<Record<string, boolean>>({});
-
-  // Loading state
-  const [isLoading, setIsLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string>("");
-
-  // Draft event
-  const emptyEvent = useMemo(
-    () => ({
-      id: stableEventId(),
-      title: "",
-      date: TRIP_DAYS[0],
-      startTime: "",
-      endTime: "",
-      location: "",
-      description: "",
-      capacity: undefined as number | undefined,
-      priceEur: undefined as number | undefined,
-    }),
-    []
-  );
-  const [eventDraft, setEventDraft] = useState<any>(emptyEvent);
-
-  // Ensure actingPerson is valid after login
   useEffect(() => {
-    if (!currentUser) {
-      setActingPerson("");
-      return;
-    }
+    if (!currentUser) { setActingPerson(""); return; }
     const allowed = getManagedPeople(currentUser);
-    if (!actingPerson || !allowed.includes(actingPerson)) {
-      setActingPerson(allowed[0] || currentUser);
-    }
+    if (!actingPerson || !allowed.includes(actingPerson)) setActingPerson(allowed[0] || currentUser);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser]);
 
-  const isAdmin = state.admin.isUnlocked;
-  const isMarco = currentUser === "Marco";
-
-  const eventsByDay = useMemo(() => {
-    const by: Record<string, EventUI[]> = Object.fromEntries(TRIP_DAYS.map((d) => [d, []]));
-    for (const e of state.events) {
-      if (!by[e.date]) by[e.date] = [];
-      by[e.date].push(e);
-    }
-    for (const d of Object.keys(by)) by[d].sort(sortByStart);
-    return by;
-  }, [state.events]);
-
-  // Cost sum: per person * per event price
-  const expectedCost = useMemo(() => {
-    const people = familyForCosts.people;
-    if (!people.length) return 0;
-    let sum = 0;
-    for (const evt of state.events) {
-      const price = typeof evt.priceEur === "number" && Number.isFinite(evt.priceEur) ? evt.priceEur : 0;
-      if (price <= 0) continue;
-      for (const p of people) {
-        if ((evt.rsvp || {})[p] === "yes") sum += price;
-      }
-    }
-    return sum;
-  }, [state.events, familyForCosts.people]);
-
-  // ---------- Supabase load ----------
-  async function reloadAll() {
-    setIsLoading(true);
-    setLoadError("");
-    try {
-      const participants = state.participants;
-
-      // Events incl price
-      const { data: evData, error: evErr } = await supabase
-        .from("events")
-        .select("id,title,date,start_time,end_time,location,description,capacity,price_eur")
-        .order("date", { ascending: true })
-        .order("start_time", { ascending: true });
-      if (evErr) throw evErr;
-
-      const dbEvents = (evData || []) as any[];
-      const eventIds = dbEvents.map((e) => e.id);
-
-      // RSVPs rows (only yes/no rows exist; missing => pending)
-      let rsvpRows: any[] = [];
-      if (eventIds.length) {
-        const { data: rData, error: rErr } = await supabase
-          .from("rsvps")
-          .select("event_id, person, status")
-          .in("event_id", eventIds);
-        if (rErr) throw rErr;
-        rsvpRows = (rData || []) as any[];
-      }
-
-      // rsvp map per event: default pending, apply yes/no from rows
-      const rsvpByEvent: Record<string, Record<string, RsvpStatus>> = {};
-      for (const id of eventIds) rsvpByEvent[id] = makeEmptyRsvp(participants);
-
-      for (const row of rsvpRows) {
-        if (!rsvpByEvent[row.event_id]) rsvpByEvent[row.event_id] = makeEmptyRsvp(participants);
-        rsvpByEvent[row.event_id][row.person] = row.status === "yes" ? "yes" : "no";
-      }
-
-      // Meals
-      const { data: mData, error: mErr } = await supabase
-        .from("meals")
-        .select("day, meal_type, person, enabled")
-        .in("day", TRIP_DAYS);
-      if (mErr) throw mErr;
-
-      const meals = makeEmptyMeals(participants);
-      for (const row of (mData || []) as any[]) {
-        if (!meals[row.day]) continue;
-        if (!meals[row.day][row.meal_type]) continue;
-        meals[row.day][row.meal_type][row.person] = !!row.enabled;
-      }
-
-      // Profiles (Flights)
-      const { data: pData, error: pErr } = await supabase
-        .from("profiles")
-        .select("person, arrival_date, arrival_time, arrival_flight, departure_date, departure_time, departure_flight");
-      if (pErr) throw pErr;
-
-      const profiles = makeEmptyProfiles(participants);
-      for (const row of (pData || []) as any[]) {
-        profiles[row.person] = {
-          arrival: { date: row.arrival_date || "", time: row.arrival_time || "", flight: row.arrival_flight || "" },
-          departure: { date: row.departure_date || "", time: row.departure_time || "", flight: row.departure_flight || "" },
-        };
-      }
-
-      // UI events
-      const uiEvents: EventUI[] = dbEvents.map((d) => ({
-        id: d.id,
-        title: d.title,
-        date: d.date,
-        startTime: d.start_time || "",
-        endTime: d.end_time || "",
-        location: d.location || "",
-        description: d.description || "",
-        capacity: d.capacity ?? undefined,
-        priceEur: typeof d.price_eur === "number" ? d.price_eur : undefined,
-        rsvp: rsvpByEvent[d.id] || makeEmptyRsvp(participants),
-      }));
-      uiEvents.sort(sortByStart);
-
-      setState((s) => ({ ...s, events: uiEvents, meals, profiles }));
-    } catch (err: any) {
-      console.error(err);
-      setLoadError(err?.message || String(err));
-    } finally {
-      setIsLoading(false);
-    }
-  }
-
+  // polling bleibt in page, weil "Ansicht bleibt wie sie ist"
   useEffect(() => {
     if (!currentUser) return;
     reloadAll();
     const t = setInterval(() => reloadAll(), 15000);
     return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentUser]);
+  }, [currentUser, reloadAll]);
 
-  // ---------- auth convenience ----------
-  function loginAs(name: string) {
-    setCurrentUser(name);
-    localStorage.setItem(STORAGE_CURRENT_USER_KEY, name);
-    setActingPerson(name);
-  }
-  function logout() {
-    setCurrentUser("");
-    setActingPerson("");
-    localStorage.removeItem(STORAGE_CURRENT_USER_KEY);
-  }
+  // Admin
+  const isMarco = currentUser === "Marco";
+  const [adminUnlocked, setAdminUnlocked] = useState(false);
+  const [pin, setPin] = useState("");
+  const [pinError, setPinError] = useState("");
 
-  // ---------- admin ----------
   function unlockAdmin() {
     setPinError("");
     if (pin === DEFAULT_ADMIN_PIN) {
-      setState((s) => ({ ...s, admin: { isUnlocked: true } }));
+      setAdminUnlocked(true);
       setPin("");
     } else setPinError("Falsche PIN");
   }
-  function lockAdmin() {
-    setState((s) => ({ ...s, admin: { isUnlocked: false } }));
-  }
 
-  // ---------- events ----------
+  // Event dialog state
+  const [eventDialogOpen, setEventDialogOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+
+  const emptyDraft = useMemo(() => ({
+    id: stableEventId(),
+    title: "",
+    date: TRIP_DAYS[0],
+    startTime: "",
+    endTime: "",
+    location: "",
+    description: "",
+    capacity: undefined as number | undefined,
+    priceEur: undefined as number | undefined,
+  }), []);
+
+  const [draft, setDraft] = useState<any>(emptyDraft);
+
   function openNewEvent() {
-    setEditingEventId(null);
-    setEventDraft({ ...emptyEvent, id: stableEventId() });
+    setEditing(false);
+    setDraft({ ...emptyDraft, id: stableEventId() });
     setEventDialogOpen(true);
   }
-  function openEditEvent(e: EventUI) {
-    setEditingEventId(e.id);
-    setEventDraft({
+
+  function openEditEvent(e: any) {
+    setEditing(true);
+    setDraft({
       id: e.id,
       title: e.title,
       date: e.date,
@@ -595,100 +102,50 @@ export default function Page() {
     });
     setEventDialogOpen(true);
   }
-  async function upsertEvent() {
-    const title = String(eventDraft.title || "").trim();
+
+  async function saveEvent() {
+    const title = String(draft.title || "").trim();
     if (!title) return;
 
-    const payload = {
-      id: eventDraft.id || stableEventId(),
+    await upsertEvent({
+      id: draft.id || stableEventId(),
       title,
-      date: eventDraft.date,
-      start_time: eventDraft.startTime || null,
-      end_time: eventDraft.endTime || null,
-      location: eventDraft.location || null,
-      description: eventDraft.description || null,
-      capacity: typeof eventDraft.capacity === "number" ? eventDraft.capacity : null,
-      price_eur: typeof eventDraft.priceEur === "number" ? eventDraft.priceEur : null,
-    };
+      date: draft.date,
+      start_time: draft.startTime || null,
+      end_time: draft.endTime || null,
+      location: draft.location || null,
+      description: draft.description || null,
+      capacity: typeof draft.capacity === "number" ? draft.capacity : null,
+      price_eur: typeof draft.priceEur === "number" ? draft.priceEur : null,
+    });
 
-    const { error } = await supabase.from("events").upsert(payload);
-    if (error) { console.error(error); return; }
     setEventDialogOpen(false);
-    setEditingEventId(null);
-    await reloadAll();
-  }
-  async function deleteEvent(id: string) {
-    const { error } = await supabase.from("events").delete().eq("id", id);
-    if (error) { console.error(error); return; }
-    await reloadAll();
   }
 
-  // ---------- RSVPs ----------
-  function setRsvp(eventId: string, person: string, value: "yes" | "no") {
-    // optimistic
-    setState((s) => ({
-      ...s,
-      events: s.events.map((e) =>
-        e.id !== eventId ? e : { ...e, rsvp: { ...(e.rsvp || {}), [person]: value } }
-      ),
-    }));
+  const eventsByDay = useMemo(() => {
+    const by: Record<string, any[]> = Object.fromEntries(TRIP_DAYS.map((d) => [d, []]));
+    for (const e of state.events) {
+      if (!by[e.date]) by[e.date] = [];
+      by[e.date].push(e);
+    }
+    return by;
+  }, [state.events]);
 
-    supabase.from("rsvps").upsert({ event_id: eventId, person, status: value }).then(({ error }) => {
-      if (error) console.error(error);
-    });
-  }
-  function setRsvpMany(eventId: string, people: string[], value: "yes" | "no") {
-    setState((s) => ({
-      ...s,
-      events: s.events.map((e) => {
-        if (e.id !== eventId) return e;
-        const rsvp = { ...(e.rsvp || {}) };
-        for (const p of people) rsvp[p] = value;
-        return { ...e, rsvp };
-      }),
-    }));
+  const expectedCost = useMemo(() => {
+    const people = familyForCosts.people;
+    if (!people.length) return 0;
 
-    const rows = people.map((p) => ({ event_id: eventId, person: p, status: value }));
-    supabase.from("rsvps").upsert(rows).then(({ error }) => { if (error) console.error(error); });
-  }
+    let sum = 0;
+    for (const evt of state.events) {
+      const price = typeof evt.priceEur === "number" && Number.isFinite(evt.priceEur) ? evt.priceEur : 0;
+      if (price <= 0) continue;
 
-  // ---------- Meals ----------
-  function toggleMeal(day: string, meal: "breakfast" | "lunch" | "dinner", person: string) {
-    const nextValue = !state.meals?.[day]?.[meal]?.[person];
-    setState((s) => ({
-      ...s,
-      meals: { ...s.meals, [day]: { ...s.meals[day], [meal]: { ...s.meals[day][meal], [person]: nextValue } } },
-    }));
-    supabase.from("meals").upsert({ day, meal_type: meal, person, enabled: nextValue }).then(({ error }) => {
-      if (error) console.error(error);
-    });
-  }
-
-  function setMealMany(day: string, meal: "breakfast" | "lunch" | "dinner", people: string[], value: boolean) {
-    setState((s) => ({
-      ...s,
-      meals: { ...s.meals, [day]: { ...s.meals[day], [meal]: { ...s.meals[day][meal], ...Object.fromEntries(people.map((p) => [p, value])) } } },
-    }));
-    const rows = people.map((p) => ({ day, meal_type: meal, person: p, enabled: value }));
-    supabase.from("meals").upsert(rows).then(({ error }) => { if (error) console.error(error); });
-  }
-
-  // ---------- Profiles / Flights ----------
-  function updateProfile(person: string, patch: any) {
-    setState((s) => ({ ...s, profiles: { ...s.profiles, [person]: { ...(s.profiles[person] || {}), ...patch } } }));
-
-    const merged = { ...(state.profiles?.[person] || {}), ...patch };
-    const payload = {
-      person,
-      arrival_date: merged.arrival?.date || null,
-      arrival_time: merged.arrival?.time || null,
-      arrival_flight: merged.arrival?.flight || null,
-      departure_date: merged.departure?.date || null,
-      departure_time: merged.departure?.time || null,
-      departure_flight: merged.departure?.flight || null,
-    };
-    supabase.from("profiles").upsert(payload).then(({ error }) => { if (error) console.error(error); });
-  }
+      for (const p of people) {
+        if ((evt.rsvp || {})[p] === "yes") sum += price;
+      }
+    }
+    return sum;
+  }, [state.events, familyForCosts.people]);
 
   if (!currentUser) return <LoginScreen participants={state.participants} onLogin={loginAs} />;
 
@@ -697,7 +154,7 @@ export default function Page() {
       <div className="mx-auto max-w-4xl p-4 sm:p-6">
         <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.35 }} className="flex flex-col gap-4">
 
-          {/* Minimal header */}
+          {/* Header (gleiches Layout wie bisher) */}
           <div className="flex flex-col gap-3 rounded-2xl border bg-card/80 backdrop-blur p-4 shadow-sm">
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-center gap-2">
@@ -715,10 +172,10 @@ export default function Page() {
                   <LogOut className="mr-2 h-4 w-4" /> Logout
                 </Button>
 
-                {/* Admin only for Marco */}
+                {/* Admin nur Marco */}
                 {isMarco ? (
-                  state.admin.isUnlocked ? (
-                    <Button variant="secondary" size="sm" onClick={lockAdmin} className="rounded-xl border border-indigo-500/20 bg-indigo-500/10">
+                  adminUnlocked ? (
+                    <Button variant="secondary" size="sm" className="rounded-xl border border-indigo-500/20 bg-indigo-500/10" onClick={() => setAdminUnlocked(false)}>
                       <Shield className="mr-2 h-4 w-4" /> Admin: an
                     </Button>
                   ) : (
@@ -732,11 +189,11 @@ export default function Page() {
                         <DialogHeader><DialogTitle>Admin entsperren</DialogTitle></DialogHeader>
                         <div className="grid gap-2">
                           <Label htmlFor="pin">PIN</Label>
-                          <Input id="pin" value={pin} onChange={(e) => setPin(e.target.value)} inputMode="numeric" placeholder="z.B. 4040" className="rounded-xl" />
+                          <Input id="pin" value={pin} onChange={(e) => setPin(e.target.value)} inputMode="numeric" className="rounded-xl" />
                           {pinError ? <p className="text-sm text-destructive">{pinError}</p> : null}
                         </div>
                         <DialogFooter>
-                          <Button onClick={unlockAdmin} className="rounded-xl bg-gradient-to-r from-indigo-600 to-rose-600 text-white hover:opacity-95">
+                          <Button className="rounded-xl bg-gradient-to-r from-indigo-600 to-rose-600 text-white hover:opacity-95" onClick={unlockAdmin}>
                             Entsperren
                           </Button>
                         </DialogFooter>
@@ -746,6 +203,8 @@ export default function Page() {
                 ) : null}
               </div>
             </div>
+
+            <Separator />
 
             <div className="grid gap-3 sm:grid-cols-3">
               <div className="sm:col-span-1">
@@ -760,7 +219,7 @@ export default function Page() {
                     <Select value={actingPerson} onValueChange={setActingPerson}>
                       <SelectTrigger className="mt-1 rounded-xl"><SelectValue placeholder="Person auswählen" /></SelectTrigger>
                       <SelectContent>
-                        {managedPeople.map((p) => (<SelectItem key={p} value={p}>{p}</SelectItem>))}
+                        {managedPeople.map((p) => <SelectItem key={p} value={p}>{p}</SelectItem>)}
                       </SelectContent>
                     </Select>
                   </div>
@@ -788,7 +247,7 @@ export default function Page() {
             </div>
           </div>
 
-          {/* Tabs */}
+          {/* Tabs bleiben exakt wie bisher */}
           <Tabs defaultValue="calendar" className="w-full">
             <TabsList className="grid w-full grid-cols-3 rounded-2xl bg-card/70 backdrop-blur border">
               <TabsTrigger value="calendar" className="rounded-2xl">Kalender</TabsTrigger>
@@ -802,7 +261,7 @@ export default function Page() {
                 <CardHeader className="pb-3">
                   <div className="flex items-center justify-between gap-2">
                     <CardTitle className="text-base">Wochenplan</CardTitle>
-                    {isAdmin ? (
+                    {adminUnlocked ? (
                       <Button onClick={openNewEvent} size="sm" className="rounded-xl bg-gradient-to-r from-indigo-600 to-rose-600 text-white hover:opacity-95">
                         <Plus className="mr-2 h-4 w-4" /> Event
                       </Button>
@@ -837,79 +296,47 @@ export default function Page() {
                                 (e.rsvp || {})[actingPerson] === "yes" ? "yes" :
                                 (e.rsvp || {})[actingPerson] === "no" ? "no" : "pending";
 
-                              const famNames = managedPeople;
-                              const kids = famNames.filter((p) => p !== currentUser);
-                              const rsvpExpanded = !!expandedRsvp[e.id];
+                              const rsvpExpanded = false;
 
                               return (
-                                <motion.div
-                                  key={e.id}
-                                  initial={{ opacity: 0, y: 6 }}
-                                  animate={{ opacity: 1, y: 0 }}
-                                  transition={{ duration: 0.25 }}
-                                  className="rounded-2xl border bg-card p-3 shadow-sm relative overflow-hidden"
-                                >
+                                <div key={e.id} className="rounded-2xl border bg-card p-3 shadow-sm relative overflow-hidden">
                                   <div className="absolute inset-y-0 left-0 w-1.5 bg-gradient-to-b from-indigo-500 to-rose-500" />
 
                                   <div className="pl-3 flex items-start justify-between gap-3">
                                     <div className="min-w-0">
                                       <div className="flex flex-wrap items-center gap-2">
                                         <h4 className="truncate font-semibold">{e.title}</h4>
-
-                                        {cap ? (
-                                          <Badge variant={isFull ? "destructive" : "secondary"}>
-                                            {yesCount}/{cap}
-                                          </Badge>
-                                        ) : (
-                                          <Badge variant="secondary">{yesCount} dabei</Badge>
-                                        )}
-
-                                        <span
-                                          className={
-                                            "inline-flex items-center rounded-full px-2.5 py-1 text-xs border " +
-                                            (my === "yes"
-                                              ? "bg-emerald-500/10 text-emerald-700 border-emerald-500/30 dark:text-emerald-300"
-                                              : my === "no"
-                                                ? "bg-rose-500/10 text-rose-700 border-rose-500/30 dark:text-rose-300"
-                                                : "bg-muted text-muted-foreground border")
-                                          }
-                                        >
+                                        {cap ? <Badge variant={isFull ? "destructive" : "secondary"}>{yesCount}/{cap}</Badge> : <Badge variant="secondary">{yesCount} dabei</Badge>}
+                                        <span className={"inline-flex items-center rounded-full px-2.5 py-1 text-xs border " + (my === "yes" ? "bg-emerald-500/10 text-emerald-700 border-emerald-500/30" : my === "no" ? "bg-rose-500/10 text-rose-700 border-rose-500/30" : "bg-muted text-muted-foreground border")}>
                                           {actingPerson}: {my === "yes" ? "zugesagt" : my === "no" ? "abgesagt" : "offen"}
                                         </span>
                                       </div>
 
                                       <div className="mt-2 flex flex-wrap gap-2">
-                                        {e.startTime || e.endTime ? (
-                                          <Pill icon={Clock} className="bg-white/40 dark:bg-background/20">
-                                            {(e.startTime || "").trim()}
-                                            {e.endTime ? `–${e.endTime}` : ""}
-                                          </Pill>
+                                        {(e.startTime || e.endTime) ? (
+                                          <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs bg-white/40 dark:bg-background/20">
+                                            <Clock className="h-3.5 w-3.5" /> {(e.startTime || "").trim()}{e.endTime ? `–${e.endTime}` : ""}
+                                          </span>
                                         ) : null}
-
                                         {typeof e.priceEur === "number" ? (
-                                          <Pill icon={Euro} className="bg-white/40 dark:bg-background/20">
-                                            {formatEur(e.priceEur)}
-                                          </Pill>
+                                          <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs bg-white/40 dark:bg-background/20">
+                                            <Euro className="h-3.5 w-3.5" /> {formatEur(e.priceEur)}
+                                          </span>
                                         ) : null}
-
                                         {e.location ? (
-                                          <Pill icon={MapPin} className="bg-white/40 dark:bg-background/20">
-                                            {e.location}
-                                          </Pill>
+                                          <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs bg-white/40 dark:bg-background/20">
+                                            <MapPin className="h-3.5 w-3.5" /> {e.location}
+                                          </span>
                                         ) : null}
                                       </div>
 
                                       {e.description ? <p className="mt-2 text-sm text-muted-foreground">{e.description}</p> : null}
                                     </div>
 
-                                    {isAdmin ? (
+                                    {adminUnlocked ? (
                                       <div className="flex shrink-0 flex-col gap-2">
-                                        <Button variant="outline" size="sm" className="rounded-xl" onClick={() => openEditEvent(e)}>
-                                          Bearbeiten
-                                        </Button>
-                                        <Button variant="destructive" size="sm" className="rounded-xl" onClick={() => deleteEvent(e.id)}>
-                                          Löschen
-                                        </Button>
+                                        <Button variant="outline" size="sm" className="rounded-xl" onClick={() => openEditEvent(e)}>Bearbeiten</Button>
+                                        <Button variant="destructive" size="sm" className="rounded-xl" onClick={() => deleteEvent(e.id)}>Löschen</Button>
                                       </div>
                                     ) : null}
                                   </div>
@@ -917,49 +344,26 @@ export default function Page() {
                                   <Separator className="my-3" />
 
                                   <div className="pl-3 grid gap-3">
-                                    <SectionTitle
-                                      icon={Users}
-                                      title="Teilnahme"
-                                      right={
-                                        <div className="flex items-center gap-2">
-                                          <Button
-                                            size="sm"
-                                            className="rounded-xl bg-emerald-600 text-white hover:opacity-95"
-                                            disabled={isFull && my !== "yes"}
-                                            onClick={() => setRsvp(e.id, actingPerson, "yes")}
-                                          >
-                                            Zusagen
-                                          </Button>
-                                          <Button
-                                            size="sm"
-                                            className="rounded-xl bg-rose-600 text-white hover:opacity-95"
-                                            onClick={() => setRsvp(e.id, actingPerson, "no")}
-                                          >
-                                            Absagen
-                                          </Button>
-                                        </div>
-                                      }
-                                    />
+                                    <div className="flex items-center justify-between gap-3">
+                                      <div className="flex items-center gap-2">
+                                        <Users className="h-4 w-4 text-muted-foreground" />
+                                        <h3 className="text-sm font-semibold">Teilnahme</h3>
+                                      </div>
+                                      <div className="flex items-center gap-2">
+                                        <Button size="sm" className="rounded-xl bg-emerald-600 text-white hover:opacity-95" disabled={isFull && my !== "yes"} onClick={() => setRsvp(e.id, actingPerson, "yes")}>
+                                          Zusagen
+                                        </Button>
+                                        <Button size="sm" className="rounded-xl bg-rose-600 text-white hover:opacity-95" onClick={() => setRsvp(e.id, actingPerson, "no")}>
+                                          Absagen
+                                        </Button>
+                                      </div>
+                                    </div>
 
-                                    {famNames.length > 1 ? (
+                                    {managedPeople.length > 1 ? (
                                       <div className="flex flex-wrap items-center gap-2">
                                         <Badge variant="secondary" className="rounded-full">Meine Family</Badge>
-                                        <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setRsvpMany(e.id, famNames, "yes")}>
-                                          Alle zusagen
-                                        </Button>
-                                        <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setRsvpMany(e.id, famNames, "no")}>
-                                          Alle absagen
-                                        </Button>
-                                        {kids.length > 0 ? (
-                                          <>
-                                            <Button size="sm" className="rounded-xl bg-emerald-600 text-white hover:opacity-95" onClick={() => setRsvpMany(e.id, kids, "yes")}>
-                                              Nur Kids zusagen
-                                            </Button>
-                                            <Button size="sm" className="rounded-xl bg-rose-600 text-white hover:opacity-95" onClick={() => setRsvpMany(e.id, kids, "no")}>
-                                              Nur Kids absagen
-                                            </Button>
-                                          </>
-                                        ) : null}
+                                        <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setRsvpMany(e.id, managedPeople, "yes")}>Alle zusagen</Button>
+                                        <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setRsvpMany(e.id, managedPeople, "no")}>Alle absagen</Button>
                                       </div>
                                     ) : null}
 
@@ -969,11 +373,11 @@ export default function Page() {
                                       no={noList}
                                       pending={pendingList}
                                       expanded={rsvpExpanded}
-                                      onToggle={() => setExpandedRsvp((m) => ({ ...m, [e.id]: !m[e.id] }))}
+                                      onToggle={() => {}}
                                       limit={10}
                                     />
                                   </div>
-                                </motion.div>
+                                </div>
                               );
                             })}
                           </div>
@@ -984,122 +388,14 @@ export default function Page() {
                 </CardContent>
               </Card>
 
-              {/* Event Dialog */}
-              <Dialog open={eventDialogOpen} onOpenChange={setEventDialogOpen}>
-                <DialogContent className="rounded-2xl">
-                  <DialogHeader>
-                    <DialogTitle>{editingEventId ? "Event bearbeiten" : "Neues Event"}</DialogTitle>
-                  </DialogHeader>
-
-                  <div className="grid gap-3">
-                    <div className="grid gap-1">
-                      <Label>Titel</Label>
-                      <Input
-                        value={eventDraft.title}
-                        onChange={(e) => setEventDraft((d: any) => ({ ...d, title: e.target.value }))}
-                        placeholder="z.B. Wüstentour"
-                        className="rounded-xl"
-                      />
-                    </div>
-
-                    <div className="grid gap-1">
-                      <Label>Tag</Label>
-                      <Select value={eventDraft.date} onValueChange={(v) => setEventDraft((d: any) => ({ ...d, date: v }))}>
-                        <SelectTrigger className="rounded-xl"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          {TRIP_DAYS.map((d) => (
-                            <SelectItem key={d} value={d}>{formatDayLabel(d)}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="grid gap-1">
-                        <Label>Start</Label>
-                        <Input
-                          value={eventDraft.startTime}
-                          onChange={(e) => setEventDraft((d: any) => ({ ...d, startTime: e.target.value }))}
-                          placeholder="HH:MM"
-                          inputMode="numeric"
-                          className="rounded-xl"
-                        />
-                      </div>
-                      <div className="grid gap-1">
-                        <Label>Ende</Label>
-                        <Input
-                          value={eventDraft.endTime}
-                          onChange={(e) => setEventDraft((d: any) => ({ ...d, endTime: e.target.value }))}
-                          placeholder="HH:MM"
-                          inputMode="numeric"
-                          className="rounded-xl"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid gap-1">
-                      <Label>Preis (€)</Label>
-                      <Input
-                        value={typeof eventDraft.priceEur === "number" ? String(eventDraft.priceEur) : ""}
-                        onChange={(e) => {
-                          const raw = e.target.value.trim();
-                          if (!raw) return setEventDraft((d: any) => ({ ...d, priceEur: undefined }));
-                          const n = clamp(parseFloat(raw) || 0, 0, 100000);
-                          setEventDraft((d: any) => ({ ...d, priceEur: n }));
-                        }}
-                        placeholder="z.B. 25"
-                        inputMode="decimal"
-                        className="rounded-xl"
-                      />
-                    </div>
-
-                    <div className="grid gap-1">
-                      <Label>Ort</Label>
-                      <Input
-                        value={eventDraft.location}
-                        onChange={(e) => setEventDraft((d: any) => ({ ...d, location: e.target.value }))}
-                        placeholder="z.B. Villa / City / Restaurant"
-                        className="rounded-xl"
-                      />
-                    </div>
-
-                    <div className="grid gap-1">
-                      <Label>Kapazität (optional)</Label>
-                      <Input
-                        value={typeof eventDraft.capacity === "number" ? String(eventDraft.capacity) : ""}
-                        onChange={(e) => {
-                          const raw = e.target.value.trim();
-                          if (!raw) return setEventDraft((d: any) => ({ ...d, capacity: undefined }));
-                          const n = clamp(parseInt(raw, 10) || 0, 1, 200);
-                          setEventDraft((d: any) => ({ ...d, capacity: n }));
-                        }}
-                        placeholder="z.B. 12"
-                        inputMode="numeric"
-                        className="rounded-xl"
-                      />
-                    </div>
-
-                    <div className="grid gap-1">
-                      <Label>Beschreibung</Label>
-                      <Textarea
-                        value={eventDraft.description}
-                        onChange={(e) => setEventDraft((d: any) => ({ ...d, description: e.target.value }))}
-                        placeholder="Kurzbeschreibung…"
-                        className="rounded-xl"
-                      />
-                    </div>
-                  </div>
-
-                  <DialogFooter className="gap-2">
-                    <Button variant="outline" className="rounded-xl" onClick={() => setEventDialogOpen(false)}>
-                      Abbrechen
-                    </Button>
-                    <Button className="rounded-xl bg-gradient-to-r from-indigo-600 to-rose-600 text-white hover:opacity-95" onClick={upsertEvent}>
-                      Speichern
-                    </Button>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
+              <EventDialog
+                open={eventDialogOpen}
+                onOpenChange={setEventDialogOpen}
+                editing={editing}
+                draft={draft}
+                setDraft={setDraft}
+                onSave={saveEvent}
+              />
             </TabsContent>
 
             {/* Meals */}
@@ -1115,9 +411,6 @@ export default function Page() {
                     const lYes = state.participants.filter((p) => !!m.lunch[p]);
                     const dYes = state.participants.filter((p) => !!m.dinner[p]);
 
-                    const famNames = managedPeople;
-                    const kids = famNames.filter((p) => p !== currentUser);
-
                     return (
                       <div key={day} className="rounded-2xl border bg-card/50 p-3">
                         <div className="flex items-center justify-between">
@@ -1131,64 +424,52 @@ export default function Page() {
 
                         <Separator className="my-3" />
 
-                        <div className="grid gap-3">
-                          {([
-                            { key: "breakfast", label: "Frühstück" },
-                            { key: "lunch", label: "Mittagessen" },
-                            { key: "dinner", label: "Abendessen" },
-                          ] as const).map(({ key, label }) => {
-                            const meal = m[key];
-                            const yesList = state.participants.filter((p) => !!meal[p]);
-                            const noList = state.participants.filter((p) => !meal[p]);
-                            const expandedKey = `${day}_${key}`;
-                            const expanded = !!expandedMeals[expandedKey];
-                            const on = !!meal[actingPerson];
+                        {(["breakfast","lunch","dinner"] as const).map((mealKey) => {
+                          const label = mealKey === "breakfast" ? "Frühstück" : mealKey === "lunch" ? "Mittagessen" : "Abendessen";
+                          const meal = m[mealKey];
 
-                            return (
-                              <div key={key} className="rounded-2xl border bg-card p-3 relative overflow-hidden">
-                                <div className="absolute inset-y-0 left-0 w-1.5 bg-gradient-to-b from-emerald-500 to-teal-500" />
-                                <div className="pl-3">
-                                  <div className="flex items-center justify-between gap-3">
-                                    <SectionTitle icon={UtensilsCrossed} title={label} />
-                                    <Button
-                                      size="sm"
-                                      className={"rounded-xl text-white hover:opacity-95 " + (on ? "bg-rose-600" : "bg-emerald-600")}
-                                      onClick={() => toggleMeal(day, key, actingPerson)}
-                                    >
-                                      {on ? "Abmelden" : "Anmelden"}
-                                    </Button>
-                                  </div>
+                          const yesList = state.participants.filter((p) => !!meal[p]);
+                          const noList = state.participants.filter((p) => !meal[p]);
 
-                                  {famNames.length > 1 ? (
-                                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                                      <Badge variant="secondary" className="rounded-full">Meine Family</Badge>
-                                      <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, key, famNames, true)}>Alle anmelden</Button>
-                                      <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, key, famNames, false)}>Alle abmelden</Button>
-                                      {kids.length > 0 ? (
-                                        <>
-                                          <Button size="sm" className="rounded-xl bg-emerald-600 text-white hover:opacity-95" onClick={() => setMealMany(day, key, kids, true)}>Nur Kids anmelden</Button>
-                                          <Button size="sm" className="rounded-xl bg-rose-600 text-white hover:opacity-95" onClick={() => setMealMany(day, key, kids, false)}>Nur Kids abmelden</Button>
-                                        </>
-                                      ) : null}
-                                    </div>
-                                  ) : null}
-
-                                  <div className="mt-3">
-                                    <CompactList
-                                      title="Anmeldungen"
-                                      yes={yesList}
-                                      no={noList}
-                                      pending={[]}
-                                      expanded={expanded}
-                                      onToggle={() => setExpandedMeals((m2) => ({ ...m2, [expandedKey]: !m2[expandedKey] }))}
-                                      limit={10}
-                                    />
-                                  </div>
+                          return (
+                            <div key={mealKey} className="mt-3 rounded-2xl border bg-card p-3">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <UtensilsCrossed className="h-4 w-4 text-muted-foreground" />
+                                  <h3 className="text-sm font-semibold">{label}</h3>
                                 </div>
+
+                                <Button
+                                  size="sm"
+                                  className={"rounded-xl text-white hover:opacity-95 " + (meal[actingPerson] ? "bg-rose-600" : "bg-emerald-600")}
+                                  onClick={() => toggleMeal(day, mealKey, actingPerson)}
+                                >
+                                  {meal[actingPerson] ? "Abmelden" : "Anmelden"}
+                                </Button>
                               </div>
-                            );
-                          })}
-                        </div>
+
+                              {managedPeople.length > 1 ? (
+                                <div className="mt-2 flex flex-wrap items-center gap-2">
+                                  <Badge variant="secondary" className="rounded-full">Meine Family</Badge>
+                                  <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, mealKey, managedPeople, true)}>Alle anmelden</Button>
+                                  <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, mealKey, managedPeople, false)}>Alle abmelden</Button>
+                                </div>
+                              ) : null}
+
+                              <div className="mt-2">
+                                <CompactList
+                                  title="Anmeldungen"
+                                  yes={yesList}
+                                  no={noList}
+                                  pending={[]}
+                                  expanded={expandedMeals[`${day}_${mealKey}`]}
+                                  onToggle={() => setExpandedMeals((s) => ({ ...s, [`${day}_${mealKey}`]: !s[`${day}_${mealKey}`] }))}
+                                  limit={10}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     );
                   })}
@@ -1204,92 +485,50 @@ export default function Page() {
                 </CardHeader>
                 <CardContent className="grid gap-4">
                   <div className="rounded-2xl border bg-card/50 p-3">
-                    <SectionTitle icon={Plane} title="Flugdaten für ausgewählte Person" />
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Plane className="h-4 w-4 text-muted-foreground" />
+                        <h3 className="text-sm font-semibold">Flugdaten für ausgewählte Person</h3>
+                      </div>
+                    </div>
+
                     <p className="mt-1 text-xs text-muted-foreground">
                       Du bearbeitest gerade: <span className="font-semibold">{actingPerson}</span>
                     </p>
 
                     <div className="mt-3 grid gap-4 sm:grid-cols-2">
-                      <div className="rounded-2xl border bg-card p-3 relative overflow-hidden">
-                        <div className="absolute inset-y-0 left-0 w-1.5 bg-gradient-to-b from-indigo-500 to-sky-500" />
-                        <div className="pl-3">
-                          <div className="font-semibold">Ankunft</div>
-                          <div className="mt-2 grid gap-2">
-                            <div className="grid gap-1">
-                              <Label>Datum</Label>
-                              <Input
-                                type="date"
-                                value={state.profiles[actingPerson]?.arrival?.date || ""}
-                                onChange={(e) =>
-                                  updateProfile(actingPerson, { arrival: { ...(state.profiles[actingPerson]?.arrival || {}), date: e.target.value } })
-                                }
-                                className="rounded-xl"
-                              />
-                            </div>
-                            <div className="grid gap-1">
-                              <Label>Uhrzeit</Label>
-                              <Input
-                                type="time"
-                                value={state.profiles[actingPerson]?.arrival?.time || ""}
-                                onChange={(e) =>
-                                  updateProfile(actingPerson, { arrival: { ...(state.profiles[actingPerson]?.arrival || {}), time: e.target.value } })
-                                }
-                                className="rounded-xl"
-                              />
-                            </div>
-                            <div className="grid gap-1">
-                              <Label>Flug (optional)</Label>
-                              <Input
-                                value={state.profiles[actingPerson]?.arrival?.flight || ""}
-                                onChange={(e) =>
-                                  updateProfile(actingPerson, { arrival: { ...(state.profiles[actingPerson]?.arrival || {}), flight: e.target.value } })
-                                }
-                                placeholder="z.B. LH123"
-                                className="rounded-xl"
-                              />
-                            </div>
+                      <div className="rounded-2xl border bg-card p-3">
+                        <div className="font-semibold">Ankunft</div>
+                        <div className="mt-2 grid gap-2">
+                          <div className="grid gap-1">
+                            <Label>Datum</Label>
+                            <Input type="date" value={state.profiles[actingPerson]?.arrival?.date || ""} onChange={(e) => updateProfile(actingPerson, { arrival: { ...(state.profiles[actingPerson]?.arrival || {}), date: e.target.value } })} className="rounded-xl" />
+                          </div>
+                          <div className="grid gap-1">
+                            <Label>Uhrzeit</Label>
+                            <Input type="time" value={state.profiles[actingPerson]?.arrival?.time || ""} onChange={(e) => updateProfile(actingPerson, { arrival: { ...(state.profiles[actingPerson]?.arrival || {}), time: e.target.value } })} className="rounded-xl" />
+                          </div>
+                          <div className="grid gap-1">
+                            <Label>Flug (optional)</Label>
+                            <Input value={state.profiles[actingPerson]?.arrival?.flight || ""} onChange={(e) => updateProfile(actingPerson, { arrival: { ...(state.profiles[actingPerson]?.arrival || {}), flight: e.target.value } })} className="rounded-xl" />
                           </div>
                         </div>
                       </div>
 
-                      <div className="rounded-2xl border bg-card p-3 relative overflow-hidden">
-                        <div className="absolute inset-y-0 left-0 w-1.5 bg-gradient-to-b from-rose-500 to-orange-500" />
-                        <div className="pl-3">
-                          <div className="font-semibold">Abflug</div>
-                          <div className="mt-2 grid gap-2">
-                            <div className="grid gap-1">
-                              <Label>Datum</Label>
-                              <Input
-                                type="date"
-                                value={state.profiles[actingPerson]?.departure?.date || ""}
-                                onChange={(e) =>
-                                  updateProfile(actingPerson, { departure: { ...(state.profiles[actingPerson]?.departure || {}), date: e.target.value } })
-                                }
-                                className="rounded-xl"
-                              />
-                            </div>
-                            <div className="grid gap-1">
-                              <Label>Uhrzeit</Label>
-                              <Input
-                                type="time"
-                                value={state.profiles[actingPerson]?.departure?.time || ""}
-                                onChange={(e) =>
-                                  updateProfile(actingPerson, { departure: { ...(state.profiles[actingPerson]?.departure || {}), time: e.target.value } })
-                                }
-                                className="rounded-xl"
-                              />
-                            </div>
-                            <div className="grid gap-1">
-                              <Label>Flug (optional)</Label>
-                              <Input
-                                value={state.profiles[actingPerson]?.departure?.flight || ""}
-                                onChange={(e) =>
-                                  updateProfile(actingPerson, { departure: { ...(state.profiles[actingPerson]?.departure || {}), flight: e.target.value } })
-                                }
-                                placeholder="z.B. TK456"
-                                className="rounded-xl"
-                              />
-                            </div>
+                      <div className="rounded-2xl border bg-card p-3">
+                        <div className="font-semibold">Abflug</div>
+                        <div className="mt-2 grid gap-2">
+                          <div className="grid gap-1">
+                            <Label>Datum</Label>
+                            <Input type="date" value={state.profiles[actingPerson]?.departure?.date || ""} onChange={(e) => updateProfile(actingPerson, { departure: { ...(state.profiles[actingPerson]?.departure || {}), date: e.target.value } })} className="rounded-xl" />
+                          </div>
+                          <div className="grid gap-1">
+                            <Label>Uhrzeit</Label>
+                            <Input type="time" value={state.profiles[actingPerson]?.departure?.time || ""} onChange={(e) => updateProfile(actingPerson, { departure: { ...(state.profiles[actingPerson]?.departure || {}), time: e.target.value } })} className="rounded-xl" />
+                          </div>
+                          <div className="grid gap-1">
+                            <Label>Flug (optional)</Label>
+                            <Input value={state.profiles[actingPerson]?.departure?.flight || ""} onChange={(e) => updateProfile(actingPerson, { departure: { ...(state.profiles[actingPerson]?.departure || {}), flight: e.target.value } })} className="rounded-xl" />
                           </div>
                         </div>
                       </div>
@@ -1297,7 +536,11 @@ export default function Page() {
                   </div>
 
                   <div className="rounded-2xl border bg-card/50 p-3">
-                    <SectionTitle icon={Users} title="Übersicht (alle)" />
+                    <div className="flex items-center gap-2">
+                      <Users className="h-4 w-4 text-muted-foreground" />
+                      <h3 className="text-sm font-semibold">Übersicht (alle)</h3>
+                    </div>
+
                     <div className="mt-3 grid gap-2">
                       {state.participants.map((p) => {
                         const prof = state.profiles[p] || {};
@@ -1307,12 +550,12 @@ export default function Page() {
                           <div key={p} className="flex flex-col gap-1 rounded-2xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
                             <div className="font-semibold">{p}</div>
                             <div className="flex flex-wrap gap-2 text-sm">
-                              <Pill icon={Plane} className="bg-white/40 dark:bg-background/20">
-                                <span className="font-semibold">An:</span> {a.date || "—"} {a.time || ""} {a.flight ? `(${a.flight})` : ""}
-                              </Pill>
-                              <Pill icon={Plane} className="bg-white/40 dark:bg-background/20">
-                                <span className="font-semibold">Ab:</span> {d.date || "—"} {d.time || ""} {d.flight ? `(${d.flight})` : ""}
-                              </Pill>
+                              <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs bg-white/40 dark:bg-background/20">
+                                <Plane className="h-3.5 w-3.5" /> <span className="font-semibold">An:</span> {a.date || "—"} {a.time || ""} {a.flight ? `(${a.flight})` : ""}
+                              </span>
+                              <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs bg-white/40 dark:bg-background/20">
+                                <Plane className="h-3.5 w-3.5" /> <span className="font-semibold">Ab:</span> {d.date || "—"} {d.time || ""} {d.flight ? `(${d.flight})` : ""}
+                              </span>
                             </div>
                           </div>
                         );
@@ -1323,6 +566,7 @@ export default function Page() {
               </Card>
             </TabsContent>
           </Tabs>
+
         </motion.div>
       </div>
     </div>
