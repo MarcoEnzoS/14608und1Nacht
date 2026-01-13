@@ -8,6 +8,8 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { supabase } from "@/lib/supabaseClient";
 import { fetchEvents, seedEventsIfEmpty, upsertEvent as upsertEventDb, deleteEventById } from "@/lib/eventsApi";
+import { fetchRsvpsForEvents, upsertRsvp as upsertRsvpDb, upsertRsvpsBulk } from "@/lib/rsvpApi";
+
 import {
   Select,
   SelectContent,
@@ -483,6 +485,34 @@ export default function BirthdayTripPlannerApp() {
   }, [state]);
 
 useEffect(() => {
+  async function loadRsvps() {
+    try {
+      const eventIds = state.events.map((e) => e.id);
+      const rows = await fetchRsvpsForEvents(eventIds);
+
+      setState((s) => ({
+        ...s,
+        events: s.events.map((evt) => {
+          const rsvp = { ...(evt.rsvp || {}) };
+          for (const row of rows) {
+            if (row.event_id === evt.id) {
+              rsvp[row.person] = row.status;
+            }
+          }
+          return { ...evt, rsvp };
+        }),
+      }));
+    } catch (err: any) {
+      console.error("Loading RSVPs from Supabase failed:", err?.message || err);
+    }
+  }
+
+  loadRsvps();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+
+useEffect(() => {
   async function loadEventsFromSupabase() {
     try {
       // 1) falls DB leer: mit deinen zwei Default-Events seed’en
@@ -666,26 +696,41 @@ function deleteEvent(id) {
 }
 
 
-  function setRsvp(eventId, name, value) {
-    setState((s) => ({
-      ...s,
-      events: s.events.map((e) =>
-        e.id !== eventId ? e : { ...e, rsvp: { ...(e.rsvp || {}), [name]: value } }
-      ),
-    }));
-  }
+function setRsvp(eventId, name, value) {
+  // 1) UI sofort updaten (optimistisch)
+  setState((s) => ({
+    ...s,
+    events: s.events.map((e) =>
+      e.id !== eventId ? e : { ...e, rsvp: { ...(e.rsvp || {}), [name]: value } }
+    ),
+  }));
 
-  function setRsvpMany(eventId, names, value) {
-    setState((s) => ({
-      ...s,
-      events: s.events.map((e) => {
-        if (e.id !== eventId) return e;
-        const rsvp = { ...(e.rsvp || {}) };
-        for (const n of names) rsvp[n] = value;
-        return { ...e, rsvp };
-      }),
-    }));
-  }
+  // 2) in Supabase speichern
+  upsertRsvpDb(eventId, name, value).catch((err: any) =>
+    console.error("Supabase RSVP upsert failed:", err?.message || err)
+  );
+}
+
+
+function setRsvpMany(eventId, names, value) {
+  // 1) UI updaten
+  setState((s) => ({
+    ...s,
+    events: s.events.map((e) => {
+      if (e.id !== eventId) return e;
+      const rsvp = { ...(e.rsvp || {}) };
+      for (const n of names) rsvp[n] = value;
+      return { ...e, rsvp };
+    }),
+  }));
+
+  // 2) Bulk in Supabase speichern
+  const rows = names.map((n) => ({ event_id: eventId, person: n, status: value }));
+  upsertRsvpsBulk(rows).catch((err: any) =>
+    console.error("Supabase RSVP bulk upsert failed:", err?.message || err)
+  );
+}
+
 
   function updateProfile(name, patch) {
     setState((s) => ({
