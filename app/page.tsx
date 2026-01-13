@@ -36,28 +36,25 @@ import {
   Users,
   UtensilsCrossed,
   Shield,
-  Search,
-  Download,
   LogOut,
   UserCircle2,
-  Sparkles,
   CheckCircle2,
   XCircle,
   RefreshCw,
+  Euro,
 } from "lucide-react";
 
 /**
- * Marco 40 · Trip Planner (Supabase-first)
- * ✅ Events from Supabase
+ * Marco 40 · Trip Planner (Supabase-first, with Prices + Cost Summary)
+ * ✅ Events (incl. price_eur) from Supabase
  * ✅ RSVPs from Supabase (shared)
  * ✅ Meals from Supabase (shared)
  * ✅ Flights/Profiles from Supabase (shared)
  * ✅ Parents can manage kids
- * ✅ Admin can add/edit/delete events
+ * ✅ Minimal header + cost summary
+ * ✅ Admin button only visible for Marco
  *
- * Notes:
- * - RLS is currently disabled (MVP A).
- * - We still store ONLY the selected user name in localStorage for convenience.
+ * DB requirement: events table has numeric column `price_eur` (nullable)
  */
 
 // ---------- Config ----------
@@ -108,7 +105,7 @@ const GUARDIANS: Record<string, string[]> = {
 const STORAGE_CURRENT_USER_KEY = "bday40_planner_current_user_v1";
 const DEFAULT_ADMIN_PIN = "4040";
 
-// ---------- Types (lightweight) ----------
+// ---------- Types ----------
 type Person = string;
 
 type EventUI = {
@@ -120,6 +117,7 @@ type EventUI = {
   location?: string;
   description?: string;
   capacity?: number;
+  priceEur?: number; // NEW
   rsvp: Record<Person, "yes" | "no">;
 };
 
@@ -182,24 +180,31 @@ function uniqPreserveOrder(arr: string[]) {
 
 function getManagedPeople(currentUser: string) {
   if (!currentUser) return [];
-  const kids = Object.keys(GUARDIANS).filter((kid) => (GUARDIANS[kid] || []).includes(currentUser));
+  const kids = Object.keys(GUARDIANS).filter((kid) =>
+    (GUARDIANS[kid] || []).includes(currentUser)
+  );
   return uniqPreserveOrder([currentUser, ...kids]);
 }
 
-function splitFamily(managedPeople: string[], currentUser: string) {
-  const me = currentUser;
-  const kids = managedPeople.filter((p) => p !== me);
-  return { me, kids };
-}
+function getFamilyGroupForCosts(currentUser: string) {
+  if (!currentUser) return { label: "dich", people: [] as string[] };
 
-function chunkDisplay(list: string[], limit: number) {
-  const shown = list.slice(0, limit);
-  const rest = list.length - shown.length;
-  return { shown, rest };
+  const kids = Object.keys(GUARDIANS).filter((kid) =>
+    (GUARDIANS[kid] || []).includes(currentUser)
+  );
+
+  // Co-parents are the other guardians of those kids
+  const coParents = uniqPreserveOrder(
+    kids.flatMap((kid) => (GUARDIANS[kid] || []).filter((p) => p !== currentUser))
+  );
+
+  const people = uniqPreserveOrder([currentUser, ...coParents, ...kids]);
+  const isFamily = kids.length > 0 || coParents.length > 0;
+
+  return { label: isFamily ? "deine Family" : "dich", people };
 }
 
 function stableEventId() {
-  // stable ID for DB row
   // @ts-ignore
   if (typeof crypto !== "undefined" && crypto.randomUUID) return `evt_${crypto.randomUUID()}`;
   return `evt_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
@@ -223,6 +228,12 @@ function makeEmptyProfiles(participants: string[]): ProfilesUI {
 
 function makeEmptyRsvp(participants: string[]): Record<string, "yes" | "no"> {
   return Object.fromEntries(participants.map((p) => [p, "no"]));
+}
+
+function formatEur(value?: number) {
+  const v = typeof value === "number" && Number.isFinite(value) ? value : 0;
+  // You can switch to toFixed(2) if you want cents
+  return `${v.toFixed(0)}€`;
 }
 
 // ---------- UI bits ----------
@@ -277,6 +288,12 @@ function RSVPBadge({ name, status }: { name: string; status: "yes" | "no" }) {
   );
 }
 
+function chunkDisplay(list: string[], limit: number) {
+  const shown = list.slice(0, limit);
+  const rest = list.length - shown.length;
+  return { shown, rest };
+}
+
 function CompactList({ title, yes, no, expanded, onToggle, limit = 10, right }: any) {
   const { shown, rest } = chunkDisplay(yes, limit);
   return (
@@ -293,7 +310,6 @@ function CompactList({ title, yes, no, expanded, onToggle, limit = 10, right }: 
           </div>
         }
       />
-
       <div className="mt-2 flex flex-wrap gap-2">
         {!expanded ? (
           <>
@@ -405,12 +421,10 @@ export default function Page() {
   });
 
   const managedPeople = useMemo(() => getManagedPeople(currentUser), [currentUser]);
-  const { kids } = useMemo(() => splitFamily(managedPeople, currentUser), [managedPeople, currentUser]);
+  const familyForCosts = useMemo(() => getFamilyGroupForCosts(currentUser), [currentUser]);
   const [actingPerson, setActingPerson] = useState("");
 
-  const [filter, setFilter] = useState({ q: "", day: "all" });
-
-  // Admin unlock dialog
+  // Admin unlock
   const [pin, setPin] = useState("");
   const [pinError, setPinError] = useState("");
 
@@ -437,10 +451,10 @@ export default function Page() {
       location: "",
       description: "",
       capacity: undefined as number | undefined,
+      priceEur: undefined as number | undefined,
     }),
     []
   );
-
   const [eventDraft, setEventDraft] = useState<any>(emptyEvent);
 
   // Ensure actingPerson is valid
@@ -467,23 +481,30 @@ export default function Page() {
   }, [state.events, actingPerson, currentUser]);
 
   const eventsByDay = useMemo(() => {
-    const q = filter.q.trim().toLowerCase();
-    let list = [...state.events];
-    if (filter.day !== "all") list = list.filter((e) => e.date === filter.day);
-    if (q) {
-      list = list.filter((e) => {
-        const hay = `${e.title} ${e.location || ""} ${e.description || ""}`.toLowerCase();
-        return hay.includes(q);
-      });
-    }
     const by: Record<string, EventUI[]> = Object.fromEntries(TRIP_DAYS.map((d) => [d, []]));
-    for (const e of list) {
+    for (const e of state.events) {
       if (!by[e.date]) by[e.date] = [];
       by[e.date].push(e);
     }
     for (const d of Object.keys(by)) by[d].sort(sortByStart);
     return by;
-  }, [state.events, filter.day, filter.q]);
+  }, [state.events]);
+
+  const expectedCost = useMemo(() => {
+    const people = familyForCosts.people;
+    if (!people.length) return 0;
+
+    let sum = 0;
+    for (const evt of state.events) {
+      const price = typeof evt.priceEur === "number" && Number.isFinite(evt.priceEur) ? evt.priceEur : 0;
+      if (price <= 0) continue;
+
+      for (const p of people) {
+        if ((evt.rsvp || {})[p] === "yes") sum += price;
+      }
+    }
+    return sum;
+  }, [state.events, familyForCosts.people]);
 
   // ---------- Supabase: load all shared data ----------
   async function reloadAll() {
@@ -492,13 +513,14 @@ export default function Page() {
     try {
       const participants = state.participants;
 
-      // 1) Events
+      // 1) Events (incl. price_eur)
       const { data: evData, error: evErr } = await supabase
         .from("events")
-        .select("*")
+        .select("id,title,date,start_time,end_time,location,description,capacity,price_eur")
         .order("date", { ascending: true })
         .order("start_time", { ascending: true });
       if (evErr) throw evErr;
+
       const dbEvents = (evData || []) as any[];
       const eventIds = dbEvents.map((e) => e.id);
 
@@ -527,6 +549,7 @@ export default function Page() {
         .select("day, meal_type, person, enabled")
         .in("day", TRIP_DAYS);
       if (mErr) throw mErr;
+
       const meals = makeEmptyMeals(participants);
       for (const row of (mData || []) as any[]) {
         if (!meals[row.day]) continue;
@@ -539,6 +562,7 @@ export default function Page() {
         .from("profiles")
         .select("person, arrival_date, arrival_time, arrival_flight, departure_date, departure_time, departure_flight");
       if (pErr) throw pErr;
+
       const profiles = makeEmptyProfiles(participants);
       for (const row of (pData || []) as any[]) {
         profiles[row.person] = {
@@ -565,6 +589,7 @@ export default function Page() {
         location: d.location || "",
         description: d.description || "",
         capacity: d.capacity ?? undefined,
+        priceEur: typeof d.price_eur === "number" ? d.price_eur : undefined,
         rsvp: rsvpByEvent[d.id] || makeEmptyRsvp(participants),
       }));
       uiEvents.sort(sortByStart);
@@ -587,13 +612,12 @@ export default function Page() {
   useEffect(() => {
     if (!currentUser) return;
     reloadAll();
-    // refresh every 15s (simple sync without realtime)
     const t = setInterval(() => reloadAll(), 15000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser]);
 
-  // ---------- Auth-ish convenience ----------
+  // ---------- Auth convenience ----------
   function loginAs(name: string) {
     setCurrentUser(name);
     localStorage.setItem(STORAGE_CURRENT_USER_KEY, name);
@@ -606,7 +630,7 @@ export default function Page() {
     localStorage.removeItem(STORAGE_CURRENT_USER_KEY);
   }
 
-  // ---------- Admin PIN ----------
+  // ---------- Admin ----------
   function unlockAdmin() {
     setPinError("");
     if (pin === DEFAULT_ADMIN_PIN) {
@@ -639,6 +663,7 @@ export default function Page() {
       location: e.location || "",
       description: e.description || "",
       capacity: typeof e.capacity === "number" ? e.capacity : undefined,
+      priceEur: typeof e.priceEur === "number" ? e.priceEur : undefined,
     });
     setEventDialogOpen(true);
   }
@@ -656,6 +681,7 @@ export default function Page() {
       location: eventDraft.location || null,
       description: eventDraft.description || null,
       capacity: typeof eventDraft.capacity === "number" ? eventDraft.capacity : null,
+      price_eur: typeof eventDraft.priceEur === "number" ? eventDraft.priceEur : null,
     };
 
     const { error } = await supabase.from("events").upsert(payload);
@@ -678,9 +704,8 @@ export default function Page() {
     await reloadAll();
   }
 
-  // ---------- RSVPs (Supabase) ----------
+  // ---------- RSVPs ----------
   function setRsvp(eventId: string, person: string, value: "yes" | "no") {
-    // Optimistic UI
     setState((s) => ({
       ...s,
       events: s.events.map((e) =>
@@ -713,11 +738,10 @@ export default function Page() {
     });
   }
 
-  // ---------- Meals (Supabase) ----------
+  // ---------- Meals ----------
   function toggleMeal(day: string, meal: "breakfast" | "lunch" | "dinner", person: string) {
     const nextValue = !state.meals?.[day]?.[meal]?.[person];
 
-    // Optimistic UI
     setState((s) => ({
       ...s,
       meals: {
@@ -741,7 +765,6 @@ export default function Page() {
   }
 
   function setMealMany(day: string, meal: "breakfast" | "lunch" | "dinner", people: string[], value: boolean) {
-    // Optimistic UI
     setState((s) => ({
       ...s,
       meals: {
@@ -762,9 +785,8 @@ export default function Page() {
     });
   }
 
-  // ---------- Profiles/Flights (Supabase) ----------
+  // ---------- Profiles / Flights ----------
   function updateProfile(person: string, patch: any) {
-    // optimistic
     setState((s) => ({
       ...s,
       profiles: {
@@ -793,27 +815,6 @@ export default function Page() {
     });
   }
 
-  // ---------- Export (Supabase snapshot) ----------
-  function exportJson() {
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      participants: state.participants,
-      events: state.events,
-      meals: state.meals,
-      profiles: state.profiles,
-    };
-
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "bday40-planner-export.json";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
-
   if (!currentUser) {
     return <LoginScreen participants={state.participants} onLogin={loginAs} />;
   }
@@ -827,162 +828,124 @@ export default function Page() {
           transition={{ duration: 0.35 }}
           className="flex flex-col gap-4"
         >
-          {/* Header */}
+          {/* Minimal Header */}
           <div className="flex flex-col gap-3 rounded-2xl border bg-card/80 backdrop-blur p-4 shadow-sm">
             <div className="flex items-start justify-between gap-3">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="inline-flex h-9 w-9 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500/20 to-rose-500/20 border">
-                    <Calendar className="h-5 w-5" />
-                  </span>
-                  <div>
-                    <h1 className="text-xl font-semibold leading-tight">Marco 40 · Trip Planner</h1>
-                    <p className="text-sm text-muted-foreground">01.–06.09.2026 · Mobil im Browser</p>
-                  </div>
-                </div>
+              <div className="flex items-center gap-2">
+                <span className="inline-flex h-9 w-9 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500/20 to-rose-500/20 border">
+                  <Calendar className="h-5 w-5" />
+                </span>
+                <h1 className="text-xl font-semibold leading-tight">Marco 40 · Trip Planner</h1>
               </div>
 
               <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" className="rounded-xl" onClick={reloadAll}>
+                  <RefreshCw className="mr-2 h-4 w-4" /> Refresh
+                </Button>
                 <Button variant="outline" size="sm" className="rounded-xl" onClick={logout}>
                   <LogOut className="mr-2 h-4 w-4" /> Logout
                 </Button>
 
-                <Button variant="outline" size="sm" className="rounded-xl" onClick={reloadAll}>
-                  <RefreshCw className="mr-2 h-4 w-4" /> Refresh
-                </Button>
-
-                {state.admin.isUnlocked ? (
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={lockAdmin}
-                    className="rounded-xl border border-indigo-500/20 bg-indigo-500/10"
-                  >
-                    <Shield className="mr-2 h-4 w-4" /> Admin: an
-                  </Button>
-                ) : (
-                  <Dialog>
-                    <DialogTrigger asChild>
-                      <Button variant="outline" size="sm" className="rounded-xl">
-                        <Shield className="mr-2 h-4 w-4" /> Admin
-                      </Button>
-                    </DialogTrigger>
-                    <DialogContent className="rounded-2xl">
-                      <DialogHeader>
-                        <DialogTitle>Admin entsperren</DialogTitle>
-                      </DialogHeader>
-                      <div className="grid gap-2">
-                        <Label htmlFor="pin">PIN</Label>
-                        <Input
-                          id="pin"
-                          value={pin}
-                          onChange={(e) => setPin(e.target.value)}
-                          inputMode="numeric"
-                          placeholder="z.B. 4040"
-                          className="rounded-xl"
-                        />
-                        {pinError ? <p className="text-sm text-destructive">{pinError}</p> : null}
-                        <p className="text-xs text-muted-foreground">
-                          MVP-Hinweis: PIN ist nur ein leichter Schutz (kein echter Login).
-                        </p>
-                      </div>
-                      <DialogFooter>
-                        <Button
-                          onClick={unlockAdmin}
-                          className="rounded-xl bg-gradient-to-r from-indigo-600 to-rose-600 text-white hover:opacity-95"
-                        >
-                          Entsperren
+                {/* Admin only visible for Marco */}
+                {currentUser === "Marco" ? (
+                  state.admin.isUnlocked ? (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={lockAdmin}
+                      className="rounded-xl border border-indigo-500/20 bg-indigo-500/10"
+                    >
+                      <Shield className="mr-2 h-4 w-4" /> Admin: an
+                    </Button>
+                  ) : (
+                    <Dialog>
+                      <DialogTrigger asChild>
+                        <Button variant="outline" size="sm" className="rounded-xl">
+                          <Shield className="mr-2 h-4 w-4" /> Admin
                         </Button>
-                      </DialogFooter>
-                    </DialogContent>
-                  </Dialog>
-                )}
+                      </DialogTrigger>
+                      <DialogContent className="rounded-2xl">
+                        <DialogHeader>
+                          <DialogTitle>Admin entsperren</DialogTitle>
+                        </DialogHeader>
+                        <div className="grid gap-2">
+                          <Label htmlFor="pin">PIN</Label>
+                          <Input
+                            id="pin"
+                            value={pin}
+                            onChange={(e) => setPin(e.target.value)}
+                            inputMode="numeric"
+                            placeholder="z.B. 4040"
+                            className="rounded-xl"
+                          />
+                          {pinError ? <p className="text-sm text-destructive">{pinError}</p> : null}
+                        </div>
+                        <DialogFooter>
+                          <Button
+                            onClick={unlockAdmin}
+                            className="rounded-xl bg-gradient-to-r from-indigo-600 to-rose-600 text-white hover:opacity-95"
+                          >
+                            Entsperren
+                          </Button>
+                        </DialogFooter>
+                      </DialogContent>
+                    </Dialog>
+                  )
+                ) : null}
               </div>
             </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <Pill icon={Users} className="bg-white/50 dark:bg-background/30">
-                {state.participants.length} Teilnehmer
-              </Pill>
-              <Pill icon={UtensilsCrossed} className="bg-white/50 dark:bg-background/30">
-                Meals (Supabase)
-              </Pill>
-              <Pill icon={Plane} className="bg-white/50 dark:bg-background/30">
-                Flüge (Supabase)
-              </Pill>
-              <Pill icon={Sparkles} className="bg-white/50 dark:bg-background/30">
-                Zusagen grün · Absagen rot
-              </Pill>
-              {isLoading ? <Badge variant="secondary">lädt…</Badge> : null}
-              {loadError ? <Badge variant="destructive">{loadError}</Badge> : null}
-            </div>
-
-            <Separator />
 
             <div className="grid gap-3 sm:grid-cols-3">
               <div className="sm:col-span-1">
                 <Label>Angemeldet als</Label>
                 <div className="mt-1 rounded-xl border bg-muted/20 px-3 py-2 text-sm">
                   <span className="font-semibold">{currentUser}</span>
-                  {managedPeople.length > 1 ? (
-                    <span className="text-muted-foreground"> · kann auch für Kinder klicken</span>
-                  ) : null}
                 </div>
 
-                <div className="mt-3">
-                  <Label>Ändern für</Label>
-                  <Select value={actingPerson} onValueChange={setActingPerson}>
-                    <SelectTrigger className="mt-1 rounded-xl">
-                      <SelectValue placeholder="Person auswählen" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {managedPeople.map((p) => (
-                        <SelectItem key={p} value={p}>
-                          {p}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                {managedPeople.length > 1 ? (
+                  <div className="mt-3">
+                    <Label>Ändern für</Label>
+                    <Select value={actingPerson} onValueChange={setActingPerson}>
+                      <SelectTrigger className="mt-1 rounded-xl">
+                        <SelectValue placeholder="Person auswählen" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {managedPeople.map((p) => (
+                          <SelectItem key={p} value={p}>
+                            {p}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
 
-                  <div className="mt-2 flex items-center gap-2">
-                    <CountBadge label="zugesagt" value={actingRsvpCounts.yes} />
-                    <CountBadge label="offen/abgesagt" value={actingRsvpCounts.no} />
+                    <div className="mt-2 flex items-center gap-2">
+                      <CountBadge label="zugesagt" value={actingRsvpCounts.yes} />
+                      <CountBadge label="offen/abgesagt" value={actingRsvpCounts.no} />
+                    </div>
                   </div>
-                </div>
+                ) : null}
               </div>
 
               <div className="sm:col-span-2">
-                <Label>Suche / Filter</Label>
-                <div className="mt-1 flex flex-col gap-2 sm:flex-row">
-                  <div className="relative flex-1">
-                    <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
-                    <Input
-                      value={filter.q}
-                      onChange={(e) => setFilter((f) => ({ ...f, q: e.target.value }))}
-                      placeholder="Event, Ort, Stichwort…"
-                      className="pl-9 rounded-xl"
-                    />
+                <Label>
+                  {familyForCosts.label === "deine Family"
+                    ? `Voraussichtliche Kosten für deine Family: ${formatEur(expectedCost)}`
+                    : `Voraussichtliche Kosten für dich: ${formatEur(expectedCost)}`}
+                </Label>
+                <div className="mt-1 rounded-xl border bg-muted/20 px-3 py-3 text-sm flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Euro className="h-4 w-4 text-muted-foreground" />
+                    <span className="font-semibold">{formatEur(expectedCost)}</span>
+                    <span className="text-muted-foreground">(basierend auf Zusagen)</span>
                   </div>
-                  <Select value={filter.day} onValueChange={(v) => setFilter((f) => ({ ...f, day: v }))}>
-                    <SelectTrigger className="rounded-xl sm:w-[220px]">
-                      <SelectValue placeholder="Tag" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">Alle Tage</SelectItem>
-                      {TRIP_DAYS.map((d) => (
-                        <SelectItem key={d} value={d}>
-                          {formatDayLabel(d)}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                  <div className="flex items-center gap-2">
+                    {isLoading ? <Badge variant="secondary">lädt…</Badge> : null}
+                    {loadError ? <Badge variant="destructive">{loadError}</Badge> : null}
+                  </div>
                 </div>
-
-                <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <Button variant="outline" size="sm" className="rounded-xl" onClick={exportJson}>
-                    <Download className="mr-2 h-4 w-4" /> Export
-                  </Button>
-                </div>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Preise werden pro zugesagter Person gerechnet (bei Family: Eltern + Kinder).
+                </p>
               </div>
             </div>
           </div>
@@ -990,9 +953,15 @@ export default function Page() {
           {/* Tabs */}
           <Tabs defaultValue="calendar" className="w-full">
             <TabsList className="grid w-full grid-cols-3 rounded-2xl bg-card/70 backdrop-blur border">
-              <TabsTrigger value="calendar" className="rounded-2xl">Kalender</TabsTrigger>
-              <TabsTrigger value="meals" className="rounded-2xl">Meals</TabsTrigger>
-              <TabsTrigger value="flights" className="rounded-2xl">Flüge</TabsTrigger>
+              <TabsTrigger value="calendar" className="rounded-2xl">
+                Kalender
+              </TabsTrigger>
+              <TabsTrigger value="meals" className="rounded-2xl">
+                Meals
+              </TabsTrigger>
+              <TabsTrigger value="flights" className="rounded-2xl">
+                Flüge
+              </TabsTrigger>
             </TabsList>
 
             {/* Calendar */}
@@ -1012,6 +981,7 @@ export default function Page() {
                     ) : null}
                   </div>
                 </CardHeader>
+
                 <CardContent className="grid gap-4">
                   {TRIP_DAYS.map((day) => {
                     const items = eventsByDay[day] || [];
@@ -1035,7 +1005,9 @@ export default function Page() {
                               const isFull = typeof cap === "number" && yesCount >= cap;
                               const my = (e.rsvp || {})[actingPerson] === "yes" ? "yes" : "no";
 
-                              const famNames = managedPeople;
+                              const famNames = getManagedPeople(currentUser);
+                              const kids = famNames.filter((p) => p !== currentUser);
+
                               const rsvpExpanded = !!expandedRsvp[e.id];
 
                               return (
@@ -1078,6 +1050,13 @@ export default function Page() {
                                             {e.endTime ? `–${e.endTime}` : ""}
                                           </Pill>
                                         ) : null}
+
+                                        {typeof e.priceEur === "number" ? (
+                                          <Pill icon={Euro} className="bg-white/40 dark:bg-background/20">
+                                            {formatEur(e.priceEur)}
+                                          </Pill>
+                                        ) : null}
+
                                         {e.location ? (
                                           <Pill icon={MapPin} className="bg-white/40 dark:bg-background/20">
                                             {e.location}
@@ -1131,7 +1110,9 @@ export default function Page() {
 
                                     {famNames.length > 1 ? (
                                       <div className="flex flex-wrap items-center gap-2">
-                                        <Badge variant="secondary" className="rounded-full">Meine Family</Badge>
+                                        <Badge variant="secondary" className="rounded-full">
+                                          Meine Family
+                                        </Badge>
                                         <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setRsvpMany(e.id, famNames, "yes")}>
                                           Alle zusagen
                                         </Button>
@@ -1229,6 +1210,23 @@ export default function Page() {
                     </div>
 
                     <div className="grid gap-1">
+                      <Label>Preis (€)</Label>
+                      <Input
+                        value={typeof eventDraft.priceEur === "number" ? String(eventDraft.priceEur) : ""}
+                        onChange={(e) => {
+                          const raw = e.target.value.trim();
+                          if (!raw) return setEventDraft((d: any) => ({ ...d, priceEur: undefined }));
+                          const n = clamp(parseFloat(raw) || 0, 0, 100000);
+                          setEventDraft((d: any) => ({ ...d, priceEur: n }));
+                        }}
+                        placeholder="z.B. 25"
+                        inputMode="decimal"
+                        className="rounded-xl"
+                      />
+                      <p className="text-xs text-muted-foreground">Wird pro zugesagter Person gerechnet (Eltern + Kinder).</p>
+                    </div>
+
+                    <div className="grid gap-1">
                       <Label>Ort</Label>
                       <Input
                         value={eventDraft.location}
@@ -1252,7 +1250,6 @@ export default function Page() {
                         inputMode="numeric"
                         className="rounded-xl"
                       />
-                      <p className="text-xs text-muted-foreground">Wenn gesetzt, können sich maximal so viele Leute zusagen.</p>
                     </div>
 
                     <div className="grid gap-1">
@@ -1320,6 +1317,9 @@ export default function Page() {
                             const expanded = !!expandedMeals[expandedKey];
                             const on = !!meal[actingPerson];
 
+                            const famNames = getManagedPeople(currentUser);
+                            const kids = famNames.filter((p) => p !== currentUser);
+
                             return (
                               <div key={key} className="rounded-2xl border bg-card p-3 relative overflow-hidden">
                                 <div className="absolute inset-y-0 left-0 w-1.5 bg-gradient-to-b from-emerald-500 to-teal-500" />
@@ -1329,23 +1329,20 @@ export default function Page() {
                                     <SectionTitle icon={UtensilsCrossed} title={label} />
                                     <Button
                                       size="sm"
-                                      className={
-                                        "rounded-xl text-white hover:opacity-95 " +
-                                        (on ? "bg-rose-600" : "bg-emerald-600")
-                                      }
+                                      className={"rounded-xl text-white hover:opacity-95 " + (on ? "bg-rose-600" : "bg-emerald-600")}
                                       onClick={() => toggleMeal(day, key, actingPerson)}
                                     >
                                       {on ? "Abmelden" : "Anmelden"}
                                     </Button>
                                   </div>
 
-                                  {managedPeople.length > 1 ? (
+                                  {famNames.length > 1 ? (
                                     <div className="mt-2 flex flex-wrap items-center gap-2">
                                       <Badge variant="secondary" className="rounded-full">Meine Family</Badge>
-                                      <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, key, managedPeople, true)}>
+                                      <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, key, famNames, true)}>
                                         Alle anmelden
                                       </Button>
-                                      <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, key, managedPeople, false)}>
+                                      <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, key, famNames, false)}>
                                         Alle abmelden
                                       </Button>
                                       {kids.length > 0 ? (
@@ -1529,10 +1526,12 @@ export default function Page() {
                             <div className="font-semibold">{p}</div>
                             <div className="flex flex-wrap gap-2 text-sm">
                               <Pill icon={Plane} className="bg-white/40 dark:bg-background/20">
-                                <span className="font-semibold">An:</span> {a.date || "—"} {a.time || ""} {a.flight ? `(${a.flight})` : ""}
+                                <span className="font-semibold">An:</span> {a.date || "—"} {a.time || ""}{" "}
+                                {a.flight ? `(${a.flight})` : ""}
                               </Pill>
                               <Pill icon={Plane} className="bg-white/40 dark:bg-background/20">
-                                <span className="font-semibold">Ab:</span> {d.date || "—"} {d.time || ""} {d.flight ? `(${d.flight})` : ""}
+                                <span className="font-semibold">Ab:</span> {d.date || "—"} {d.time || ""}{" "}
+                                {d.flight ? `(${d.flight})` : ""}
                               </Pill>
                             </div>
                           </div>
@@ -1544,22 +1543,6 @@ export default function Page() {
               </Card>
             </TabsContent>
           </Tabs>
-
-          {/* Footer */}
-          <div className="rounded-2xl border bg-card/80 backdrop-blur p-4 text-sm text-muted-foreground">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-center gap-2">
-                <span className="inline-flex h-8 w-8 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500/20 to-rose-500/20 border">
-                  <Users className="h-4 w-4" />
-                </span>
-                <div>
-                  <div className="font-medium text-foreground">Shared via Supabase</div>
-                  <div>Events · RSVPs · Meals · Flights</div>
-                </div>
-              </div>
-              <div className="text-xs">Admin-PIN (MVP): <span className="font-mono">{DEFAULT_ADMIN_PIN}</span></div>
-            </div>
-          </div>
         </motion.div>
       </div>
     </div>
