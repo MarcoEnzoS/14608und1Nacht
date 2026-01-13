@@ -1,15 +1,14 @@
 'use client'
+
 import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
+import { supabase } from "@/lib/supabaseClient";
+
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { supabase } from "@/lib/supabaseClient";
-import { fetchEvents, seedEventsIfEmpty, upsertEvent as upsertEventDb, deleteEventById } from "@/lib/eventsApi";
-import { fetchRsvpsForEvents, upsertRsvp as upsertRsvpDb, upsertRsvpsBulk } from "@/lib/rsvpApi";
-
 import {
   Select,
   SelectContent,
@@ -39,26 +38,26 @@ import {
   Shield,
   Search,
   Download,
-  Upload,
   LogOut,
   UserCircle2,
   Sparkles,
   CheckCircle2,
   XCircle,
+  RefreshCw,
 } from "lucide-react";
 
 /**
- * Marco 40 · Trip Planner (MVP v3)
- * - Login-Page: Teilnehmer wählen (keine weitere Security fürs Erste)
- * - Eltern können für ihre Kinder Events + Meals an/abmelden
- * - Week view calendar (01–06 Sep 2026)
- * - Admin can add/edit/delete events (simple admin PIN)
- * - Participants can set arrival/departure flights (per person)
- * - UX upgrades:
- *   1) Family quick actions (me + kids)
- *   2) Compact RSVP/Meals lists (show YES only + “+N more”, optional expand)
- * - Visual: Zusagen = Grün, Absagen = Rot + slightly more colorful, still clean
- * - Persistence via localStorage (export/import JSON for backup)
+ * Marco 40 · Trip Planner (Supabase-first)
+ * ✅ Events from Supabase
+ * ✅ RSVPs from Supabase (shared)
+ * ✅ Meals from Supabase (shared)
+ * ✅ Flights/Profiles from Supabase (shared)
+ * ✅ Parents can manage kids
+ * ✅ Admin can add/edit/delete events
+ *
+ * Notes:
+ * - RLS is currently disabled (MVP A).
+ * - We still store ONLY the selected user name in localStorage for convenience.
  */
 
 // ---------- Config ----------
@@ -97,7 +96,7 @@ const DEFAULT_PARTICIPANTS = [
   "Carlotta",
 ];
 
-const GUARDIANS = {
+const GUARDIANS: Record<string, string[]> = {
   Emil: ["Benno", "Lx"],
   Karli: ["Benno", "Lx"],
   Flynn: ["Chris", "Carina"],
@@ -106,16 +105,55 @@ const GUARDIANS = {
   Carlotta: ["Claudia", "Maxi"],
 };
 
-const STORAGE_KEY = "bday40_planner_v3";
 const STORAGE_CURRENT_USER_KEY = "bday40_planner_current_user_v1";
 const DEFAULT_ADMIN_PIN = "4040";
 
+// ---------- Types (lightweight) ----------
+type Person = string;
+
+type EventUI = {
+  id: string;
+  title: string;
+  date: string;
+  startTime?: string;
+  endTime?: string;
+  location?: string;
+  description?: string;
+  capacity?: number;
+  rsvp: Record<Person, "yes" | "no">;
+};
+
+type ProfilesUI = Record<
+  Person,
+  {
+    arrival?: { date?: string; time?: string; flight?: string };
+    departure?: { date?: string; time?: string; flight?: string };
+  }
+>;
+
+type MealsUI = Record<
+  string,
+  {
+    breakfast: Record<Person, boolean>;
+    lunch: Record<Person, boolean>;
+    dinner: Record<Person, boolean>;
+  }
+>;
+
+type AppState = {
+  admin: { isUnlocked: boolean };
+  participants: Person[];
+  profiles: ProfilesUI;
+  events: EventUI[];
+  meals: MealsUI;
+};
+
 // ---------- Helpers ----------
-function uid(prefix = "id") {
-  return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function formatDayLabel(iso) {
+function formatDayLabel(iso: string) {
   const d = new Date(`${iso}T12:00:00`);
   return d.toLocaleDateString("de-DE", {
     weekday: "short",
@@ -124,27 +162,15 @@ function formatDayLabel(iso) {
   });
 }
 
-function sortByStart(a, b) {
+function sortByStart(a: EventUI, b: EventUI) {
   const ak = `${a.date}T${a.startTime || "00:00"}`;
   const bk = `${b.date}T${b.startTime || "00:00"}`;
   return ak.localeCompare(bk);
 }
 
-function safeParseJSON(str, fallback) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return fallback;
-  }
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function uniqPreserveOrder(arr) {
-  const seen = new Set();
-  const out = [];
+function uniqPreserveOrder(arr: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
   for (const x of arr) {
     if (!seen.has(x)) {
       seen.add(x);
@@ -154,27 +180,33 @@ function uniqPreserveOrder(arr) {
   return out;
 }
 
-function getManagedPeople(currentUser) {
+function getManagedPeople(currentUser: string) {
   if (!currentUser) return [];
   const kids = Object.keys(GUARDIANS).filter((kid) => (GUARDIANS[kid] || []).includes(currentUser));
   return uniqPreserveOrder([currentUser, ...kids]);
 }
 
-function splitFamily(managedPeople, currentUser) {
+function splitFamily(managedPeople: string[], currentUser: string) {
   const me = currentUser;
   const kids = managedPeople.filter((p) => p !== me);
   return { me, kids };
 }
 
-function chunkDisplay(list, limit) {
+function chunkDisplay(list: string[], limit: number) {
   const shown = list.slice(0, limit);
   const rest = list.length - shown.length;
   return { shown, rest };
 }
 
-// ---------- Persistence ----------
-function makeEmptyMeals(participants) {
-  const base = {};
+function stableEventId() {
+  // stable ID for DB row
+  // @ts-ignore
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return `evt_${crypto.randomUUID()}`;
+  return `evt_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
+}
+
+function makeEmptyMeals(participants: string[]): MealsUI {
+  const base: MealsUI = {};
   for (const day of TRIP_DAYS) {
     base[day] = {
       breakfast: Object.fromEntries(participants.map((p) => [p, false])),
@@ -185,84 +217,16 @@ function makeEmptyMeals(participants) {
   return base;
 }
 
-function initialState() {
-  const participants = DEFAULT_PARTICIPANTS;
-  return {
-    admin: { isUnlocked: false },
-    participants,
-    profiles: Object.fromEntries(participants.map((p) => [p, {}])),
-    events: [
-      {
-        id: uid("evt"),
-        title: "Anreise & Welcome",
-        date: "2026-09-01",
-        startTime: "18:00",
-        endTime: "20:00",
-        location: "Villa",
-        description: "Ankommen, Zimmer verteilen, Welcome Drinks.",
-        capacity: undefined,
-        rsvp: Object.fromEntries(participants.map((p) => [p, "no"])),
-      },
-      {
-        id: uid("evt"),
-        title: "Geburtstagsdinner",
-        date: "2026-09-04",
-        startTime: "19:30",
-        endTime: "22:30",
-        location: "Haus / Terrasse",
-        description: "Großes Dinner im Haus — Dresscode: easy chic.",
-        capacity: undefined,
-        rsvp: Object.fromEntries(participants.map((p) => [p, "no"])),
-      },
-    ].sort(sortByStart),
-    meals: makeEmptyMeals(participants),
-  };
+function makeEmptyProfiles(participants: string[]): ProfilesUI {
+  return Object.fromEntries(participants.map((p) => [p, {}]));
 }
 
-function loadState() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) return initialState();
-  const st = safeParseJSON(raw, null);
-  if (!st) return initialState();
-
-  const stored = Array.isArray(st.participants) ? st.participants : [];
-  const participants = uniqPreserveOrder([...(DEFAULT_PARTICIPANTS || []), ...(stored || [])]);
-
-  const profiles = st.profiles && typeof st.profiles === "object" ? st.profiles : {};
-  for (const p of participants) profiles[p] = profiles[p] || {};
-
-  const events = Array.isArray(st.events) ? st.events : [];
-  for (const e of events) {
-    e.rsvp = e.rsvp && typeof e.rsvp === "object" ? e.rsvp : {};
-    for (const p of participants) e.rsvp[p] = e.rsvp[p] || "no";
-  }
-
-  const meals = st.meals && typeof st.meals === "object" ? st.meals : makeEmptyMeals(participants);
-  for (const day of TRIP_DAYS) {
-    meals[day] = meals[day] || { breakfast: {}, lunch: {}, dinner: {} };
-    for (const meal of ["breakfast", "lunch", "dinner"]) {
-      meals[day][meal] = meals[day][meal] || {};
-      for (const p of participants) {
-        if (typeof meals[day][meal][p] !== "boolean") meals[day][meal][p] = false;
-      }
-    }
-  }
-
-  return {
-    admin: { isUnlocked: false },
-    participants,
-    profiles,
-    events: events.sort(sortByStart),
-    meals,
-  };
-}
-
-function saveState(st) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+function makeEmptyRsvp(participants: string[]): Record<string, "yes" | "no"> {
+  return Object.fromEntries(participants.map((p) => [p, "no"]));
 }
 
 // ---------- UI bits ----------
-function Pill({ icon: Icon, children, className = "" }) {
+function Pill({ icon: Icon, children, className = "" }: any) {
   return (
     <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${className}`}>
       {Icon ? <Icon className="h-3.5 w-3.5" /> : null}
@@ -271,7 +235,7 @@ function Pill({ icon: Icon, children, className = "" }) {
   );
 }
 
-function CountBadge({ label, value, max }) {
+function CountBadge({ label, value, max }: any) {
   const over = typeof max === "number" && value > max;
   return (
     <div className="flex items-center gap-2">
@@ -284,7 +248,7 @@ function CountBadge({ label, value, max }) {
   );
 }
 
-function SectionTitle({ icon: Icon, title, right }) {
+function SectionTitle({ icon: Icon, title, right }: any) {
   return (
     <div className="flex items-center justify-between gap-3">
       <div className="flex items-center gap-2">
@@ -296,7 +260,7 @@ function SectionTitle({ icon: Icon, title, right }) {
   );
 }
 
-function RSVPBadge({ name, status }) {
+function RSVPBadge({ name, status }: { name: string; status: "yes" | "no" }) {
   const yes = status === "yes";
   return (
     <span
@@ -313,15 +277,7 @@ function RSVPBadge({ name, status }) {
   );
 }
 
-function CompactList({
-  title,
-  yes,
-  no,
-  expanded,
-  onToggle,
-  limit = 10,
-  right,
-}) {
+function CompactList({ title, yes, no, expanded, onToggle, limit = 10, right }: any) {
   const { shown, rest } = chunkDisplay(yes, limit);
   return (
     <div>
@@ -331,12 +287,7 @@ function CompactList({
         right={
           <div className="flex items-center gap-2">
             {right}
-            <Button
-              variant="outline"
-              size="sm"
-              className="rounded-xl"
-              onClick={onToggle}
-            >
+            <Button variant="outline" size="sm" className="rounded-xl" onClick={onToggle}>
               {expanded ? "Kompakt" : "Alle"}
             </Button>
           </div>
@@ -346,7 +297,7 @@ function CompactList({
       <div className="mt-2 flex flex-wrap gap-2">
         {!expanded ? (
           <>
-            {shown.map((p) => (
+            {shown.map((p: string) => (
               <RSVPBadge key={p} name={p} status="yes" />
             ))}
             {rest > 0 ? (
@@ -365,10 +316,10 @@ function CompactList({
           </>
         ) : (
           <>
-            {yes.map((p) => (
+            {yes.map((p: string) => (
               <RSVPBadge key={`y_${p}`} name={p} status="yes" />
             ))}
-            {no.map((p) => (
+            {no.map((p: string) => (
               <RSVPBadge key={`n_${p}`} name={p} status="no" />
             ))}
           </>
@@ -378,7 +329,7 @@ function CompactList({
   );
 }
 
-function LoginScreen({ participants, onLogin }) {
+function LoginScreen({ participants, onLogin }: any) {
   const [name, setName] = useState("");
   return (
     <div className="min-h-screen bg-gradient-to-b from-indigo-50 via-white to-rose-50 dark:from-indigo-950 dark:via-background dark:to-rose-950">
@@ -407,7 +358,7 @@ function LoginScreen({ participants, onLogin }) {
                   <SelectValue placeholder="Teilnehmer auswählen" />
                 </SelectTrigger>
                 <SelectContent>
-                  {participants.map((p) => (
+                  {participants.map((p: string) => (
                     <SelectItem key={p} value={p}>
                       {p}
                     </SelectItem>
@@ -436,8 +387,17 @@ function LoginScreen({ participants, onLogin }) {
 }
 
 // ---------- Main component ----------
-export default function BirthdayTripPlannerApp() {
-  const [state, setState] = useState(() => (typeof window !== "undefined" ? loadState() : initialState()));
+export default function Page() {
+  const [state, setState] = useState<AppState>(() => {
+    const participants = DEFAULT_PARTICIPANTS;
+    return {
+      admin: { isUnlocked: false },
+      participants,
+      profiles: makeEmptyProfiles(participants),
+      events: [],
+      meals: makeEmptyMeals(participants),
+    };
+  });
 
   const [currentUser, setCurrentUser] = useState(() => {
     if (typeof window === "undefined") return "";
@@ -445,7 +405,7 @@ export default function BirthdayTripPlannerApp() {
   });
 
   const managedPeople = useMemo(() => getManagedPeople(currentUser), [currentUser]);
-  const { me, kids } = useMemo(() => splitFamily(managedPeople, currentUser), [managedPeople, currentUser]);
+  const { kids } = useMemo(() => splitFamily(managedPeople, currentUser), [managedPeople, currentUser]);
   const [actingPerson, setActingPerson] = useState("");
 
   const [filter, setFilter] = useState({ q: "", day: "all" });
@@ -456,128 +416,34 @@ export default function BirthdayTripPlannerApp() {
 
   // Event dialog
   const [eventDialogOpen, setEventDialogOpen] = useState(false);
-  const [editingEventId, setEditingEventId] = useState(null);
+  const [editingEventId, setEditingEventId] = useState<string | null>(null);
 
-  // Expand/collapse for RSVP/Meals per item
-  const [expandedRsvp, setExpandedRsvp] = useState(() => ({}));
-  const [expandedMeals, setExpandedMeals] = useState(() => ({}));
+  // Expand/collapse
+  const [expandedRsvp, setExpandedRsvp] = useState<Record<string, boolean>>({});
+  const [expandedMeals, setExpandedMeals] = useState<Record<string, boolean>>({});
 
+  // Loading
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string>("");
+
+  // Draft event
   const emptyEvent = useMemo(
     () => ({
-      id: uid("evt"),
+      id: stableEventId(),
       title: "",
       date: TRIP_DAYS[0],
       startTime: "",
       endTime: "",
       location: "",
       description: "",
-      capacity: undefined,
-      rsvp: Object.fromEntries(state.participants.map((p) => [p, "no"])),
+      capacity: undefined as number | undefined,
     }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state.participants.join("|")]
+    []
   );
 
-  const [eventDraft, setEventDraft] = useState(emptyEvent);
+  const [eventDraft, setEventDraft] = useState<any>(emptyEvent);
 
-  useEffect(() => {
-    saveState(state);
-  }, [state]);
-
-useEffect(() => {
-  async function loadRsvps() {
-    try {
-      const eventIds = state.events.map((e) => e.id);
-      const rows = await fetchRsvpsForEvents(eventIds);
-
-      setState((s) => ({
-        ...s,
-        events: s.events.map((evt) => {
-          const rsvp = { ...(evt.rsvp || {}) };
-          for (const row of rows) {
-            if (row.event_id === evt.id) {
-              rsvp[row.person] = row.status;
-            }
-          }
-          return { ...evt, rsvp };
-        }),
-      }));
-    } catch (err: any) {
-      console.error("Loading RSVPs from Supabase failed:", err?.message || err);
-    }
-  }
-
-  loadRsvps();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, []);
-
-
-useEffect(() => {
-  async function loadEventsFromSupabase() {
-    try {
-      // 1) falls DB leer: mit deinen zwei Default-Events seed’en
-      await seedEventsIfEmpty(
-        state.events.map((e) => ({
-          id: e.id,
-          title: e.title,
-          date: e.date,
-          start_time: e.startTime || null,
-          end_time: e.endTime || null,
-          location: e.location || null,
-          description: e.description || null,
-          capacity: typeof e.capacity === "number" ? e.capacity : null,
-        }))
-      );
-
-      // 2) dann Events holen
-      const dbEvents = await fetchEvents();
-
-      // 3) in dein UI-Format umwandeln
-      setState((s) => ({
-        ...s,
-        events: dbEvents.map((d) => ({
-          id: d.id,
-          title: d.title,
-          date: d.date,
-          startTime: d.start_time || "",
-          endTime: d.end_time || "",
-          location: d.location || "",
-          description: d.description || "",
-          capacity: d.capacity ?? undefined,
-          // RSVP bleibt erstmal lokal/default, bis wir Schritt 2 machen
-          rsvp: Object.fromEntries(s.participants.map((p) => [p, "no"])),
-        })),
-      }));
-    } catch (err: any) {
-      console.error("Supabase events load failed:", err?.message || err);
-    }
-  }
-
-  loadEventsFromSupabase();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, []);
-
-
-useEffect(() => {
-  async function pingSupabase() {
-    const { data, error } = await supabase.from("events").select("*").limit(1);
-    if (error) {
-      console.error("Supabase ping FAILED:", error.message);
-      return;
-    }
-    console.log("Supabase ping OK. Sample events row:", data);
-  }
-  pingSupabase();
-}, []);
-  
-useEffect(() => {
-    if (currentUser && !state.participants.includes(currentUser)) {
-      setCurrentUser("");
-      localStorage.removeItem(STORAGE_CURRENT_USER_KEY);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.participants.join("|")]);
-
+  // Ensure actingPerson is valid
   useEffect(() => {
     if (!currentUser) {
       setActingPerson("");
@@ -592,6 +458,14 @@ useEffect(() => {
 
   const isAdmin = state.admin.isUnlocked;
 
+  const actingRsvpCounts = useMemo(() => {
+    const person = actingPerson || currentUser;
+    if (!person) return { yes: 0, no: 0 };
+    const yes = state.events.filter((e) => e.rsvp?.[person] === "yes").length;
+    const no = state.events.filter((e) => e.rsvp?.[person] !== "yes").length;
+    return { yes, no };
+  }, [state.events, actingPerson, currentUser]);
+
   const eventsByDay = useMemo(() => {
     const q = filter.q.trim().toLowerCase();
     let list = [...state.events];
@@ -602,8 +476,7 @@ useEffect(() => {
         return hay.includes(q);
       });
     }
-
-    const by = Object.fromEntries(TRIP_DAYS.map((d) => [d, []]));
+    const by: Record<string, EventUI[]> = Object.fromEntries(TRIP_DAYS.map((d) => [d, []]));
     for (const e of list) {
       if (!by[e.date]) by[e.date] = [];
       by[e.date].push(e);
@@ -612,14 +485,128 @@ useEffect(() => {
     return by;
   }, [state.events, filter.day, filter.q]);
 
-  const actingRsvpCounts = useMemo(() => {
-    const person = actingPerson || currentUser;
-    if (!person) return { yes: 0, no: 0 };
-    const yes = state.events.filter((e) => e.rsvp?.[person] === "yes").length;
-    const no = state.events.filter((e) => e.rsvp?.[person] !== "yes").length;
-    return { yes, no };
-  }, [state.events, actingPerson, currentUser]);
+  // ---------- Supabase: load all shared data ----------
+  async function reloadAll() {
+    setIsLoading(true);
+    setLoadError("");
+    try {
+      const participants = state.participants;
 
+      // 1) Events
+      const { data: evData, error: evErr } = await supabase
+        .from("events")
+        .select("*")
+        .order("date", { ascending: true })
+        .order("start_time", { ascending: true });
+      if (evErr) throw evErr;
+      const dbEvents = (evData || []) as any[];
+      const eventIds = dbEvents.map((e) => e.id);
+
+      // 2) RSVPs for those events
+      let rsvpRows: any[] = [];
+      if (eventIds.length) {
+        const { data: rData, error: rErr } = await supabase
+          .from("rsvps")
+          .select("event_id, person, status")
+          .in("event_id", eventIds);
+        if (rErr) throw rErr;
+        rsvpRows = (rData || []) as any[];
+      }
+
+      // Build rsvp map per event
+      const rsvpByEvent: Record<string, Record<string, "yes" | "no">> = {};
+      for (const id of eventIds) rsvpByEvent[id] = makeEmptyRsvp(participants);
+      for (const row of rsvpRows) {
+        if (!rsvpByEvent[row.event_id]) rsvpByEvent[row.event_id] = makeEmptyRsvp(participants);
+        rsvpByEvent[row.event_id][row.person] = row.status === "yes" ? "yes" : "no";
+      }
+
+      // 3) Meals
+      const { data: mData, error: mErr } = await supabase
+        .from("meals")
+        .select("day, meal_type, person, enabled")
+        .in("day", TRIP_DAYS);
+      if (mErr) throw mErr;
+      const meals = makeEmptyMeals(participants);
+      for (const row of (mData || []) as any[]) {
+        if (!meals[row.day]) continue;
+        if (!meals[row.day][row.meal_type]) continue;
+        meals[row.day][row.meal_type][row.person] = !!row.enabled;
+      }
+
+      // 4) Profiles (Flights)
+      const { data: pData, error: pErr } = await supabase
+        .from("profiles")
+        .select("person, arrival_date, arrival_time, arrival_flight, departure_date, departure_time, departure_flight");
+      if (pErr) throw pErr;
+      const profiles = makeEmptyProfiles(participants);
+      for (const row of (pData || []) as any[]) {
+        profiles[row.person] = {
+          arrival: {
+            date: row.arrival_date || "",
+            time: row.arrival_time || "",
+            flight: row.arrival_flight || "",
+          },
+          departure: {
+            date: row.departure_date || "",
+            time: row.departure_time || "",
+            flight: row.departure_flight || "",
+          },
+        };
+      }
+
+      // 5) Build UI events
+      const uiEvents: EventUI[] = dbEvents.map((d) => ({
+        id: d.id,
+        title: d.title,
+        date: d.date,
+        startTime: d.start_time || "",
+        endTime: d.end_time || "",
+        location: d.location || "",
+        description: d.description || "",
+        capacity: d.capacity ?? undefined,
+        rsvp: rsvpByEvent[d.id] || makeEmptyRsvp(participants),
+      }));
+      uiEvents.sort(sortByStart);
+
+      setState((s) => ({
+        ...s,
+        events: uiEvents,
+        meals,
+        profiles,
+      }));
+    } catch (err: any) {
+      console.error(err);
+      setLoadError(err?.message || String(err));
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  // Initial load after login
+  useEffect(() => {
+    if (!currentUser) return;
+    reloadAll();
+    // refresh every 15s (simple sync without realtime)
+    const t = setInterval(() => reloadAll(), 15000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser]);
+
+  // ---------- Auth-ish convenience ----------
+  function loginAs(name: string) {
+    setCurrentUser(name);
+    localStorage.setItem(STORAGE_CURRENT_USER_KEY, name);
+    setActingPerson(name);
+  }
+
+  function logout() {
+    setCurrentUser("");
+    setActingPerson("");
+    localStorage.removeItem(STORAGE_CURRENT_USER_KEY);
+  }
+
+  // ---------- Admin PIN ----------
   function unlockAdmin() {
     setPinError("");
     if (pin === DEFAULT_ADMIN_PIN) {
@@ -634,128 +621,103 @@ useEffect(() => {
     setState((s) => ({ ...s, admin: { isUnlocked: false } }));
   }
 
+  // ---------- Events (Supabase) ----------
   function openNewEvent() {
     setEditingEventId(null);
-    setEventDraft({
-      ...emptyEvent,
-      id: uid("evt"),
-      rsvp: Object.fromEntries(state.participants.map((p) => [p, "no"])),
-    });
+    setEventDraft({ ...emptyEvent, id: stableEventId() });
     setEventDialogOpen(true);
   }
 
-  function openEditEvent(e) {
+  function openEditEvent(e: EventUI) {
     setEditingEventId(e.id);
     setEventDraft({
-      ...e,
+      id: e.id,
+      title: e.title,
+      date: e.date,
+      startTime: e.startTime || "",
+      endTime: e.endTime || "",
+      location: e.location || "",
+      description: e.description || "",
       capacity: typeof e.capacity === "number" ? e.capacity : undefined,
-      rsvp: { ...e.rsvp },
     });
     setEventDialogOpen(true);
   }
 
-  function upsertEvent() {
-    const title = eventDraft.title.trim();
+  async function upsertEvent() {
+    const title = String(eventDraft.title || "").trim();
     if (!title) return;
 
-    setState((s) => {
-      const rsvp = { ...eventDraft.rsvp };
-      for (const p of s.participants) rsvp[p] = rsvp[p] || "no";
+    const payload = {
+      id: eventDraft.id || stableEventId(),
+      title,
+      date: eventDraft.date,
+      start_time: eventDraft.startTime || null,
+      end_time: eventDraft.endTime || null,
+      location: eventDraft.location || null,
+      description: eventDraft.description || null,
+      capacity: typeof eventDraft.capacity === "number" ? eventDraft.capacity : null,
+    };
 
-      const next = { ...eventDraft, title, rsvp };
-      let events;
-      if (editingEventId) {
-        events = s.events.map((e) => (e.id === editingEventId ? next : e));
-      } else {
-        events = [...s.events, next];
-      }
-      events.sort(sortByStart);
-      return { ...s, events };
-    });
-
-  // zuerst in Supabase speichern
-  upsertEventDb({
-    id: editingEventId ? eventDraft.id : eventDraft.id,
-    title,
-    date: eventDraft.date,
-    startTime: eventDraft.startTime,
-    endTime: eventDraft.endTime,
-    location: eventDraft.location,
-    description: eventDraft.description,
-    capacity: eventDraft.capacity,
-  }).catch((err: any) => console.error("Supabase upsertEvent failed:", err?.message || err));
-
+    const { error } = await supabase.from("events").upsert(payload);
+    if (error) {
+      console.error(error);
+      return;
+    }
 
     setEventDialogOpen(false);
     setEditingEventId(null);
+    await reloadAll();
   }
 
-function deleteEvent(id) {
-  deleteEventById(id).catch((err: any) => console.error("Supabase delete failed:", err?.message || err));
-  setState((s) => ({ ...s, events: s.events.filter((e) => e.id !== id) }));
-}
+  async function deleteEvent(id: string) {
+    const { error } = await supabase.from("events").delete().eq("id", id);
+    if (error) {
+      console.error(error);
+      return;
+    }
+    await reloadAll();
+  }
 
-
-function setRsvp(eventId, name, value) {
-  // 1) UI sofort updaten (optimistisch)
-  setState((s) => ({
-    ...s,
-    events: s.events.map((e) =>
-      e.id !== eventId ? e : { ...e, rsvp: { ...(e.rsvp || {}), [name]: value } }
-    ),
-  }));
-
-  // 2) in Supabase speichern
-  upsertRsvpDb(eventId, name, value).catch((err: any) =>
-    console.error("Supabase RSVP upsert failed:", err?.message || err)
-  );
-}
-
-
-function setRsvpMany(eventId, names, value) {
-  // 1) UI updaten
-  setState((s) => ({
-    ...s,
-    events: s.events.map((e) => {
-      if (e.id !== eventId) return e;
-      const rsvp = { ...(e.rsvp || {}) };
-      for (const n of names) rsvp[n] = value;
-      return { ...e, rsvp };
-    }),
-  }));
-
-  // 2) Bulk in Supabase speichern
-  const rows = names.map((n) => ({ event_id: eventId, person: n, status: value }));
-  upsertRsvpsBulk(rows).catch((err: any) =>
-    console.error("Supabase RSVP bulk upsert failed:", err?.message || err)
-  );
-}
-
-
-  function updateProfile(name, patch) {
+  // ---------- RSVPs (Supabase) ----------
+  function setRsvp(eventId: string, person: string, value: "yes" | "no") {
+    // Optimistic UI
     setState((s) => ({
       ...s,
-      profiles: { ...s.profiles, [name]: { ...(s.profiles[name] || {}), ...patch } },
+      events: s.events.map((e) =>
+        e.id !== eventId ? e : { ...e, rsvp: { ...(e.rsvp || {}), [person]: value } }
+      ),
     }));
+
+    supabase
+      .from("rsvps")
+      .upsert({ event_id: eventId, person, status: value })
+      .then(({ error }) => {
+        if (error) console.error(error);
+      });
   }
 
-  function toggleMeal(day, meal, name) {
+  function setRsvpMany(eventId: string, people: string[], value: "yes" | "no") {
     setState((s) => ({
       ...s,
-      meals: {
-        ...s.meals,
-        [day]: {
-          ...s.meals[day],
-          [meal]: {
-            ...s.meals[day][meal],
-            [name]: !s.meals[day][meal][name],
-          },
-        },
-      },
+      events: s.events.map((e) => {
+        if (e.id !== eventId) return e;
+        const rsvp = { ...(e.rsvp || {}) };
+        for (const p of people) rsvp[p] = value;
+        return { ...e, rsvp };
+      }),
     }));
+
+    const rows = people.map((p) => ({ event_id: eventId, person: p, status: value }));
+    supabase.from("rsvps").upsert(rows).then(({ error }) => {
+      if (error) console.error(error);
+    });
   }
 
-  function setMealMany(day, meal, names, value) {
+  // ---------- Meals (Supabase) ----------
+  function toggleMeal(day: string, meal: "breakfast" | "lunch" | "dinner", person: string) {
+    const nextValue = !state.meals?.[day]?.[meal]?.[person];
+
+    // Optimistic UI
     setState((s) => ({
       ...s,
       meals: {
@@ -764,20 +726,83 @@ function setRsvpMany(eventId, names, value) {
           ...s.meals[day],
           [meal]: {
             ...s.meals[day][meal],
-            ...Object.fromEntries(names.map((n) => [n, value])),
+            [person]: nextValue,
           },
         },
       },
     }));
+
+    supabase
+      .from("meals")
+      .upsert({ day, meal_type: meal, person, enabled: nextValue })
+      .then(({ error }) => {
+        if (error) console.error(error);
+      });
   }
 
+  function setMealMany(day: string, meal: "breakfast" | "lunch" | "dinner", people: string[], value: boolean) {
+    // Optimistic UI
+    setState((s) => ({
+      ...s,
+      meals: {
+        ...s.meals,
+        [day]: {
+          ...s.meals[day],
+          [meal]: {
+            ...s.meals[day][meal],
+            ...Object.fromEntries(people.map((p) => [p, value])),
+          },
+        },
+      },
+    }));
+
+    const rows = people.map((p) => ({ day, meal_type: meal, person: p, enabled: value }));
+    supabase.from("meals").upsert(rows).then(({ error }) => {
+      if (error) console.error(error);
+    });
+  }
+
+  // ---------- Profiles/Flights (Supabase) ----------
+  function updateProfile(person: string, patch: any) {
+    // optimistic
+    setState((s) => ({
+      ...s,
+      profiles: {
+        ...s.profiles,
+        [person]: { ...(s.profiles[person] || {}), ...patch },
+      },
+    }));
+
+    const merged = {
+      ...(state.profiles?.[person] || {}),
+      ...patch,
+    };
+
+    const payload = {
+      person,
+      arrival_date: merged.arrival?.date || null,
+      arrival_time: merged.arrival?.time || null,
+      arrival_flight: merged.arrival?.flight || null,
+      departure_date: merged.departure?.date || null,
+      departure_time: merged.departure?.time || null,
+      departure_flight: merged.departure?.flight || null,
+    };
+
+    supabase.from("profiles").upsert(payload).then(({ error }) => {
+      if (error) console.error(error);
+    });
+  }
+
+  // ---------- Export (Supabase snapshot) ----------
   function exportJson() {
     const payload = {
-      ...state,
-      admin: { isUnlocked: false },
       exportedAt: new Date().toISOString(),
-      version: 3,
+      participants: state.participants,
+      events: state.events,
+      meals: state.meals,
+      profiles: state.profiles,
     };
+
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -787,62 +812,6 @@ function setRsvpMany(eventId, names, value) {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-  }
-
-  function importJson(file) {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const parsed = safeParseJSON(String(reader.result || ""), null);
-      if (!parsed) return;
-
-      const participants = uniqPreserveOrder([...(DEFAULT_PARTICIPANTS || []), ...((parsed.participants || []) as any)]);
-
-      const next = {
-        admin: { isUnlocked: false },
-        participants,
-        profiles: parsed.profiles || {},
-        events: parsed.events || [],
-        meals: parsed.meals || {},
-      };
-
-      for (const p of participants) next.profiles[p] = next.profiles[p] || {};
-      for (const e of next.events) {
-        e.rsvp = e.rsvp || {};
-        for (const p of participants) e.rsvp[p] = e.rsvp[p] || "no";
-      }
-      next.events.sort(sortByStart);
-
-      for (const day of TRIP_DAYS) {
-        next.meals[day] = next.meals[day] || { breakfast: {}, lunch: {}, dinner: {} };
-        for (const meal of ["breakfast", "lunch", "dinner"]) {
-          next.meals[day][meal] = next.meals[day][meal] || {};
-          for (const p of participants) {
-            if (typeof next.meals[day][meal][p] !== "boolean") next.meals[day][meal][p] = false;
-          }
-        }
-      }
-
-      setState(next);
-    };
-    reader.readAsText(file);
-  }
-
-  function resetAll() {
-    localStorage.removeItem(STORAGE_KEY);
-    setState(initialState());
-    setFilter({ q: "", day: "all" });
-  }
-
-  function loginAs(name) {
-    setCurrentUser(name);
-    localStorage.setItem(STORAGE_CURRENT_USER_KEY, name);
-    setActingPerson(name);
-  }
-
-  function logout() {
-    setCurrentUser("");
-    setActingPerson("");
-    localStorage.removeItem(STORAGE_CURRENT_USER_KEY);
   }
 
   if (!currentUser) {
@@ -876,6 +845,10 @@ function setRsvpMany(eventId, names, value) {
               <div className="flex items-center gap-2">
                 <Button variant="outline" size="sm" className="rounded-xl" onClick={logout}>
                   <LogOut className="mr-2 h-4 w-4" /> Logout
+                </Button>
+
+                <Button variant="outline" size="sm" className="rounded-xl" onClick={reloadAll}>
+                  <RefreshCw className="mr-2 h-4 w-4" /> Refresh
                 </Button>
 
                 {state.admin.isUnlocked ? (
@@ -932,14 +905,16 @@ function setRsvpMany(eventId, names, value) {
                 {state.participants.length} Teilnehmer
               </Pill>
               <Pill icon={UtensilsCrossed} className="bg-white/50 dark:bg-background/30">
-                Meals Signup
+                Meals (Supabase)
               </Pill>
               <Pill icon={Plane} className="bg-white/50 dark:bg-background/30">
-                Flugzeiten
+                Flüge (Supabase)
               </Pill>
               <Pill icon={Sparkles} className="bg-white/50 dark:bg-background/30">
                 Zusagen grün · Absagen rot
               </Pill>
+              {isLoading ? <Badge variant="secondary">lädt…</Badge> : null}
+              {loadError ? <Badge variant="destructive">{loadError}</Badge> : null}
             </div>
 
             <Separator />
@@ -1002,50 +977,22 @@ function setRsvpMany(eventId, names, value) {
                     </SelectContent>
                   </Select>
                 </div>
-              </div>
-            </div>
 
-            <div className="flex flex-wrap items-center gap-2 pt-1">
-              <Button variant="outline" size="sm" className="rounded-xl" onClick={exportJson}>
-                <Download className="mr-2 h-4 w-4" /> Export
-              </Button>
-              <label className="inline-flex">
-                <input
-                  type="file"
-                  accept="application/json"
-                  className="hidden"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (file) importJson(file);
-                    e.currentTarget.value = "";
-                  }}
-                />
-                <Button variant="outline" size="sm" className="rounded-xl" asChild>
-                  <span>
-                    <Upload className="mr-2 h-4 w-4" /> Import
-                  </span>
-                </Button>
-              </label>
-              {isAdmin ? (
-                <Button variant="destructive" size="sm" className="rounded-xl" onClick={resetAll}>
-                  Reset
-                </Button>
-              ) : null}
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <Button variant="outline" size="sm" className="rounded-xl" onClick={exportJson}>
+                    <Download className="mr-2 h-4 w-4" /> Export
+                  </Button>
+                </div>
+              </div>
             </div>
           </div>
 
           {/* Tabs */}
           <Tabs defaultValue="calendar" className="w-full">
             <TabsList className="grid w-full grid-cols-3 rounded-2xl bg-card/70 backdrop-blur border">
-              <TabsTrigger value="calendar" className="rounded-2xl">
-                Kalender
-              </TabsTrigger>
-              <TabsTrigger value="meals" className="rounded-2xl">
-                Meals
-              </TabsTrigger>
-              <TabsTrigger value="flights" className="rounded-2xl">
-                Flüge
-              </TabsTrigger>
+              <TabsTrigger value="calendar" className="rounded-2xl">Kalender</TabsTrigger>
+              <TabsTrigger value="meals" className="rounded-2xl">Meals</TabsTrigger>
+              <TabsTrigger value="flights" className="rounded-2xl">Flüge</TabsTrigger>
             </TabsList>
 
             {/* Calendar */}
@@ -1157,7 +1104,6 @@ function setRsvpMany(eventId, names, value) {
 
                                   <Separator className="my-3" />
 
-                                  {/* Actions */}
                                   <div className="pl-3 grid gap-3">
                                     <SectionTitle
                                       icon={Users}
@@ -1183,40 +1129,21 @@ function setRsvpMany(eventId, names, value) {
                                       }
                                     />
 
-                                    {/* Family quick actions */}
                                     {famNames.length > 1 ? (
                                       <div className="flex flex-wrap items-center gap-2">
                                         <Badge variant="secondary" className="rounded-full">Meine Family</Badge>
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          className="rounded-xl"
-                                          onClick={() => setRsvpMany(e.id, famNames, "yes")}
-                                        >
+                                        <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setRsvpMany(e.id, famNames, "yes")}>
                                           Alle zusagen
                                         </Button>
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          className="rounded-xl"
-                                          onClick={() => setRsvpMany(e.id, famNames, "no")}
-                                        >
+                                        <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setRsvpMany(e.id, famNames, "no")}>
                                           Alle absagen
                                         </Button>
                                         {kids.length > 0 ? (
                                           <>
-                                            <Button
-                                              size="sm"
-                                              className="rounded-xl bg-emerald-600 text-white hover:opacity-95"
-                                              onClick={() => setRsvpMany(e.id, kids, "yes")}
-                                            >
+                                            <Button size="sm" className="rounded-xl bg-emerald-600 text-white hover:opacity-95" onClick={() => setRsvpMany(e.id, kids, "yes")}>
                                               Nur Kids zusagen
                                             </Button>
-                                            <Button
-                                              size="sm"
-                                              className="rounded-xl bg-rose-600 text-white hover:opacity-95"
-                                              onClick={() => setRsvpMany(e.id, kids, "no")}
-                                            >
+                                            <Button size="sm" className="rounded-xl bg-rose-600 text-white hover:opacity-95" onClick={() => setRsvpMany(e.id, kids, "no")}>
                                               Nur Kids absagen
                                             </Button>
                                           </>
@@ -1224,7 +1151,6 @@ function setRsvpMany(eventId, names, value) {
                                       </div>
                                     ) : null}
 
-                                    {/* Compact RSVP list */}
                                     <CompactList
                                       title="Teilnehmer"
                                       yes={yesList}
@@ -1257,7 +1183,7 @@ function setRsvpMany(eventId, names, value) {
                       <Label>Titel</Label>
                       <Input
                         value={eventDraft.title}
-                        onChange={(e) => setEventDraft((d) => ({ ...d, title: e.target.value }))}
+                        onChange={(e) => setEventDraft((d: any) => ({ ...d, title: e.target.value }))}
                         placeholder="z.B. Wüstentour"
                         className="rounded-xl"
                       />
@@ -1265,7 +1191,7 @@ function setRsvpMany(eventId, names, value) {
 
                     <div className="grid gap-1">
                       <Label>Tag</Label>
-                      <Select value={eventDraft.date} onValueChange={(v) => setEventDraft((d) => ({ ...d, date: v }))}>
+                      <Select value={eventDraft.date} onValueChange={(v) => setEventDraft((d: any) => ({ ...d, date: v }))}>
                         <SelectTrigger className="rounded-xl">
                           <SelectValue />
                         </SelectTrigger>
@@ -1284,7 +1210,7 @@ function setRsvpMany(eventId, names, value) {
                         <Label>Start</Label>
                         <Input
                           value={eventDraft.startTime}
-                          onChange={(e) => setEventDraft((d) => ({ ...d, startTime: e.target.value }))}
+                          onChange={(e) => setEventDraft((d: any) => ({ ...d, startTime: e.target.value }))}
                           placeholder="HH:MM"
                           inputMode="numeric"
                           className="rounded-xl"
@@ -1294,7 +1220,7 @@ function setRsvpMany(eventId, names, value) {
                         <Label>Ende</Label>
                         <Input
                           value={eventDraft.endTime}
-                          onChange={(e) => setEventDraft((d) => ({ ...d, endTime: e.target.value }))}
+                          onChange={(e) => setEventDraft((d: any) => ({ ...d, endTime: e.target.value }))}
                           placeholder="HH:MM"
                           inputMode="numeric"
                           className="rounded-xl"
@@ -1306,7 +1232,7 @@ function setRsvpMany(eventId, names, value) {
                       <Label>Ort</Label>
                       <Input
                         value={eventDraft.location}
-                        onChange={(e) => setEventDraft((d) => ({ ...d, location: e.target.value }))}
+                        onChange={(e) => setEventDraft((d: any) => ({ ...d, location: e.target.value }))}
                         placeholder="z.B. Villa / City / Restaurant"
                         className="rounded-xl"
                       />
@@ -1318,9 +1244,9 @@ function setRsvpMany(eventId, names, value) {
                         value={typeof eventDraft.capacity === "number" ? String(eventDraft.capacity) : ""}
                         onChange={(e) => {
                           const raw = e.target.value.trim();
-                          if (!raw) return setEventDraft((d) => ({ ...d, capacity: undefined }));
+                          if (!raw) return setEventDraft((d: any) => ({ ...d, capacity: undefined }));
                           const n = clamp(parseInt(raw, 10) || 0, 1, 200);
-                          setEventDraft((d) => ({ ...d, capacity: n }));
+                          setEventDraft((d: any) => ({ ...d, capacity: n }));
                         }}
                         placeholder="z.B. 12"
                         inputMode="numeric"
@@ -1333,7 +1259,7 @@ function setRsvpMany(eventId, names, value) {
                       <Label>Beschreibung</Label>
                       <Textarea
                         value={eventDraft.description}
-                        onChange={(e) => setEventDraft((d) => ({ ...d, description: e.target.value }))}
+                        onChange={(e) => setEventDraft((d: any) => ({ ...d, description: e.target.value }))}
                         placeholder="Kurzbeschreibung…"
                         className="rounded-xl"
                       />
@@ -1382,11 +1308,11 @@ function setRsvpMany(eventId, names, value) {
                         <Separator className="my-3" />
 
                         <div className="grid gap-3">
-                          {[
+                          {([
                             { key: "breakfast", label: "Frühstück" },
                             { key: "lunch", label: "Mittagessen" },
                             { key: "dinner", label: "Abendessen" },
-                          ].map(({ key, label }) => {
+                          ] as const).map(({ key, label }) => {
                             const meal = m[key];
                             const yesList = state.participants.filter((p) => !!meal[p]);
                             const noList = state.participants.filter((p) => !meal[p]);
@@ -1401,54 +1327,33 @@ function setRsvpMany(eventId, names, value) {
                                 <div className="pl-3">
                                   <div className="flex items-center justify-between gap-3">
                                     <SectionTitle icon={UtensilsCrossed} title={label} />
-                                    <div className="flex items-center gap-2">
-                                      <Button
-                                        size="sm"
-                                        className={
-                                          "rounded-xl text-white hover:opacity-95 " +
-                                          (on ? "bg-rose-600" : "bg-emerald-600")
-                                        }
-                                        onClick={() => toggleMeal(day, key, actingPerson)}
-                                      >
-                                        {on ? "Abmelden" : "Anmelden"}
-                                      </Button>
-                                    </div>
+                                    <Button
+                                      size="sm"
+                                      className={
+                                        "rounded-xl text-white hover:opacity-95 " +
+                                        (on ? "bg-rose-600" : "bg-emerald-600")
+                                      }
+                                      onClick={() => toggleMeal(day, key, actingPerson)}
+                                    >
+                                      {on ? "Abmelden" : "Anmelden"}
+                                    </Button>
                                   </div>
 
-                                  {/* Family quick actions */}
                                   {managedPeople.length > 1 ? (
                                     <div className="mt-2 flex flex-wrap items-center gap-2">
                                       <Badge variant="secondary" className="rounded-full">Meine Family</Badge>
-                                      <Button
-                                        size="sm"
-                                        variant="outline"
-                                        className="rounded-xl"
-                                        onClick={() => setMealMany(day, key, managedPeople, true)}
-                                      >
+                                      <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, key, managedPeople, true)}>
                                         Alle anmelden
                                       </Button>
-                                      <Button
-                                        size="sm"
-                                        variant="outline"
-                                        className="rounded-xl"
-                                        onClick={() => setMealMany(day, key, managedPeople, false)}
-                                      >
+                                      <Button size="sm" variant="outline" className="rounded-xl" onClick={() => setMealMany(day, key, managedPeople, false)}>
                                         Alle abmelden
                                       </Button>
                                       {kids.length > 0 ? (
                                         <>
-                                          <Button
-                                            size="sm"
-                                            className="rounded-xl bg-emerald-600 text-white hover:opacity-95"
-                                            onClick={() => setMealMany(day, key, kids, true)}
-                                          >
+                                          <Button size="sm" className="rounded-xl bg-emerald-600 text-white hover:opacity-95" onClick={() => setMealMany(day, key, kids, true)}>
                                             Nur Kids anmelden
                                           </Button>
-                                          <Button
-                                            size="sm"
-                                            className="rounded-xl bg-rose-600 text-white hover:opacity-95"
-                                            onClick={() => setMealMany(day, key, kids, false)}
-                                          >
+                                          <Button size="sm" className="rounded-xl bg-rose-600 text-white hover:opacity-95" onClick={() => setMealMany(day, key, kids, false)}>
                                             Nur Kids abmelden
                                           </Button>
                                         </>
@@ -1464,11 +1369,7 @@ function setRsvpMany(eventId, names, value) {
                                       expanded={expanded}
                                       onToggle={() => setExpandedMeals((m2) => ({ ...m2, [expandedKey]: !m2[expandedKey] }))}
                                       limit={10}
-                                      right={
-                                        <div className="flex items-center gap-2">
-                                          <Badge className="rounded-full bg-emerald-600 text-white">{yesList.length}</Badge>
-                                        </div>
-                                      }
+                                      right={<Badge className="rounded-full bg-emerald-600 text-white">{yesList.length}</Badge>}
                                     />
                                   </div>
                                 </div>
@@ -1508,19 +1409,12 @@ function setRsvpMany(eventId, names, value) {
                                 type="date"
                                 value={state.profiles[actingPerson]?.arrival?.date || ""}
                                 onChange={(e) =>
-                                  setState((s) => ({
-                                    ...s,
-                                    profiles: {
-                                      ...s.profiles,
-                                      [actingPerson]: {
-                                        ...(s.profiles[actingPerson] || {}),
-                                        arrival: {
-                                          ...(s.profiles[actingPerson]?.arrival || {}),
-                                          date: e.target.value,
-                                        },
-                                      },
+                                  updateProfile(actingPerson, {
+                                    arrival: {
+                                      ...(state.profiles[actingPerson]?.arrival || {}),
+                                      date: e.target.value,
                                     },
-                                  }))
+                                  })
                                 }
                                 className="rounded-xl"
                               />
@@ -1531,19 +1425,12 @@ function setRsvpMany(eventId, names, value) {
                                 type="time"
                                 value={state.profiles[actingPerson]?.arrival?.time || ""}
                                 onChange={(e) =>
-                                  setState((s) => ({
-                                    ...s,
-                                    profiles: {
-                                      ...s.profiles,
-                                      [actingPerson]: {
-                                        ...(s.profiles[actingPerson] || {}),
-                                        arrival: {
-                                          ...(s.profiles[actingPerson]?.arrival || {}),
-                                          time: e.target.value,
-                                        },
-                                      },
+                                  updateProfile(actingPerson, {
+                                    arrival: {
+                                      ...(state.profiles[actingPerson]?.arrival || {}),
+                                      time: e.target.value,
                                     },
-                                  }))
+                                  })
                                 }
                                 className="rounded-xl"
                               />
@@ -1553,19 +1440,12 @@ function setRsvpMany(eventId, names, value) {
                               <Input
                                 value={state.profiles[actingPerson]?.arrival?.flight || ""}
                                 onChange={(e) =>
-                                  setState((s) => ({
-                                    ...s,
-                                    profiles: {
-                                      ...s.profiles,
-                                      [actingPerson]: {
-                                        ...(s.profiles[actingPerson] || {}),
-                                        arrival: {
-                                          ...(s.profiles[actingPerson]?.arrival || {}),
-                                          flight: e.target.value,
-                                        },
-                                      },
+                                  updateProfile(actingPerson, {
+                                    arrival: {
+                                      ...(state.profiles[actingPerson]?.arrival || {}),
+                                      flight: e.target.value,
                                     },
-                                  }))
+                                  })
                                 }
                                 placeholder="z.B. LH123"
                                 className="rounded-xl"
@@ -1586,19 +1466,12 @@ function setRsvpMany(eventId, names, value) {
                                 type="date"
                                 value={state.profiles[actingPerson]?.departure?.date || ""}
                                 onChange={(e) =>
-                                  setState((s) => ({
-                                    ...s,
-                                    profiles: {
-                                      ...s.profiles,
-                                      [actingPerson]: {
-                                        ...(s.profiles[actingPerson] || {}),
-                                        departure: {
-                                          ...(s.profiles[actingPerson]?.departure || {}),
-                                          date: e.target.value,
-                                        },
-                                      },
+                                  updateProfile(actingPerson, {
+                                    departure: {
+                                      ...(state.profiles[actingPerson]?.departure || {}),
+                                      date: e.target.value,
                                     },
-                                  }))
+                                  })
                                 }
                                 className="rounded-xl"
                               />
@@ -1609,19 +1482,12 @@ function setRsvpMany(eventId, names, value) {
                                 type="time"
                                 value={state.profiles[actingPerson]?.departure?.time || ""}
                                 onChange={(e) =>
-                                  setState((s) => ({
-                                    ...s,
-                                    profiles: {
-                                      ...s.profiles,
-                                      [actingPerson]: {
-                                        ...(s.profiles[actingPerson] || {}),
-                                        departure: {
-                                          ...(s.profiles[actingPerson]?.departure || {}),
-                                          time: e.target.value,
-                                        },
-                                      },
+                                  updateProfile(actingPerson, {
+                                    departure: {
+                                      ...(state.profiles[actingPerson]?.departure || {}),
+                                      time: e.target.value,
                                     },
-                                  }))
+                                  })
                                 }
                                 className="rounded-xl"
                               />
@@ -1631,19 +1497,12 @@ function setRsvpMany(eventId, names, value) {
                               <Input
                                 value={state.profiles[actingPerson]?.departure?.flight || ""}
                                 onChange={(e) =>
-                                  setState((s) => ({
-                                    ...s,
-                                    profiles: {
-                                      ...s.profiles,
-                                      [actingPerson]: {
-                                        ...(s.profiles[actingPerson] || {}),
-                                        departure: {
-                                          ...(s.profiles[actingPerson]?.departure || {}),
-                                          flight: e.target.value,
-                                        },
-                                      },
+                                  updateProfile(actingPerson, {
+                                    departure: {
+                                      ...(state.profiles[actingPerson]?.departure || {}),
+                                      flight: e.target.value,
                                     },
-                                  }))
+                                  })
                                 }
                                 placeholder="z.B. TK456"
                                 className="rounded-xl"
@@ -1681,15 +1540,6 @@ function setRsvpMany(eventId, names, value) {
                       })}
                     </div>
                   </div>
-
-                  {isAdmin ? (
-                    <div className="rounded-2xl border bg-card/50 p-3">
-                      <SectionTitle icon={Shield} title="Admin Tools" />
-                      <p className="mt-2 text-sm text-muted-foreground">
-                        Als nächstes können wir ein echtes Multi-User-Backend (z.B. Supabase) hinzufügen, damit alle wirklich dieselben Daten sehen.
-                      </p>
-                    </div>
-                  ) : null}
                 </CardContent>
               </Card>
             </TabsContent>
@@ -1703,13 +1553,11 @@ function setRsvpMany(eventId, names, value) {
                   <Users className="h-4 w-4" />
                 </span>
                 <div>
-                  <div className="font-medium text-foreground">MVP läuft lokal im Browser</div>
-                  <div>Speichert automatisch (localStorage) · Export/Import als Backup</div>
+                  <div className="font-medium text-foreground">Shared via Supabase</div>
+                  <div>Events · RSVPs · Meals · Flights</div>
                 </div>
               </div>
-              <div className="text-xs">
-                Admin-PIN (MVP): <span className="font-mono">{DEFAULT_ADMIN_PIN}</span>
-              </div>
+              <div className="text-xs">Admin-PIN (MVP): <span className="font-mono">{DEFAULT_ADMIN_PIN}</span></div>
             </div>
           </div>
         </motion.div>
