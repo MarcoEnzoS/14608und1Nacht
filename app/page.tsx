@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { supabase } from "@/lib/supabaseClient";
+import { fetchEvents, seedEventsIfEmpty, upsertEvent as upsertEventDb, deleteEventById } from "@/lib/eventsApi";
 import {
   Select,
   SelectContent,
@@ -482,6 +483,52 @@ export default function BirthdayTripPlannerApp() {
   }, [state]);
 
 useEffect(() => {
+  async function loadEventsFromSupabase() {
+    try {
+      // 1) falls DB leer: mit deinen zwei Default-Events seed’en
+      await seedEventsIfEmpty(
+        state.events.map((e) => ({
+          id: e.id,
+          title: e.title,
+          date: e.date,
+          start_time: e.startTime || null,
+          end_time: e.endTime || null,
+          location: e.location || null,
+          description: e.description || null,
+          capacity: typeof e.capacity === "number" ? e.capacity : null,
+        }))
+      );
+
+      // 2) dann Events holen
+      const dbEvents = await fetchEvents();
+
+      // 3) in dein UI-Format umwandeln
+      setState((s) => ({
+        ...s,
+        events: dbEvents.map((d) => ({
+          id: d.id,
+          title: d.title,
+          date: d.date,
+          startTime: d.start_time || "",
+          endTime: d.end_time || "",
+          location: d.location || "",
+          description: d.description || "",
+          capacity: d.capacity ?? undefined,
+          // RSVP bleibt erstmal lokal/default, bis wir Schritt 2 machen
+          rsvp: Object.fromEntries(s.participants.map((p) => [p, "no"])),
+        })),
+      }));
+    } catch (err: any) {
+      console.error("Supabase events load failed:", err?.message || err);
+    }
+  }
+
+  loadEventsFromSupabase();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+
+useEffect(() => {
   async function pingSupabase() {
     const { data, error } = await supabase.from("events").select("*").limit(1);
     if (error) {
@@ -596,13 +643,28 @@ useEffect(() => {
       return { ...s, events };
     });
 
+  // zuerst in Supabase speichern
+  upsertEventDb({
+    id: editingEventId ? eventDraft.id : eventDraft.id,
+    title,
+    date: eventDraft.date,
+    startTime: eventDraft.startTime,
+    endTime: eventDraft.endTime,
+    location: eventDraft.location,
+    description: eventDraft.description,
+    capacity: eventDraft.capacity,
+  }).catch((err: any) => console.error("Supabase upsertEvent failed:", err?.message || err));
+
+
     setEventDialogOpen(false);
     setEditingEventId(null);
   }
 
-  function deleteEvent(id) {
-    setState((s) => ({ ...s, events: s.events.filter((e) => e.id !== id) }));
-  }
+function deleteEvent(id) {
+  deleteEventById(id).catch((err: any) => console.error("Supabase delete failed:", err?.message || err));
+  setState((s) => ({ ...s, events: s.events.filter((e) => e.id !== id) }));
+}
+
 
   function setRsvp(eventId, name, value) {
     setState((s) => ({
